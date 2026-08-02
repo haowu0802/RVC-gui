@@ -1,0 +1,13 @@
+{
+  "model_name": "my_model.pth",
+  "index_path": "",
+  "f0up_key": 0,
+  "f0method": "rmvpe",
+  "index_rate": 0.75,
+  "resample_sr": 0,
+  "rms_mix_rate": 0.25,
+  "protect": 0.33,
+  "spk_id": 0,
+  "chunk_sec": 120.0,
+  "overlap_sec": 0.3
+}
