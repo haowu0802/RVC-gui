@@ -250,9 +250,13 @@ class App:
         self._job_pct: float | None = None
         self._job_total_epoch: int | None = None
         self._job_audio_duration: float | None = None
+        self.exp_locked = False
+        self._exp_lock_entries: list[ttk.Entry] = []
+        self._exp_lock_buttons: list[ttk.Button] = []
 
         # --- shared / settings ---
         self.rvc_root = tk.StringVar(value="")
+        self.active_exp_path = tk.StringVar(value="")
         self.python_path_display = tk.StringVar(value="(set RVC root first)")
         self.status_var = tk.StringVar(value="Idle")
         self.last_tab = tk.IntVar(value=0)
@@ -433,12 +437,116 @@ class App:
             self.ab_weights_dir.set(str(root / "assets" / "weights"))
         if not self.ix_outside.get().strip():
             self.ix_outside.set(str(root / "assets" / "indices"))
+        if self.exp_locked:
+            return
         if not self.ab_out_dir.get().strip():
             self.ab_out_dir.set(str(root / "logs" / "my_exp" / "infer_ab_test"))
         if not self.im_infer_output_dir.get().strip():
             self.im_infer_output_dir.set(str(root / "logs" / "my_exp" / "infer_long"))
         if not self.im_merge_output_dir.get().strip():
             self.im_merge_output_dir.set(str(root / "logs" / "my_exp" / "merged"))
+
+    def _register_exp_lock_widgets(self, *widgets: tk.Widget) -> None:
+        for w in widgets:
+            if isinstance(w, ttk.Button):
+                self._exp_lock_buttons.append(w)
+            elif isinstance(w, (ttk.Entry, tk.Entry)):
+                self._exp_lock_entries.append(w)  # type: ignore[arg-type]
+
+    def _set_exp_widgets_locked(self, locked: bool) -> None:
+        entry_state = "readonly" if locked else "normal"
+        btn_state = "disabled" if locked else "normal"
+        for entry in self._exp_lock_entries:
+            try:
+                entry.configure(state=entry_state)
+            except tk.TclError:
+                pass
+        for btn in self._exp_lock_buttons:
+            try:
+                btn.configure(state=btn_state)
+            except tk.TclError:
+                pass
+        if hasattr(self, "active_exp_entry"):
+            try:
+                self.active_exp_entry.configure(state="readonly")
+            except tk.TclError:
+                pass
+
+    def _apply_active_experiment(
+        self,
+        path: str,
+        *,
+        lock: bool = True,
+        quiet: bool = False,
+    ) -> bool:
+        raw = (path or "").strip().strip('"')
+        if not raw:
+            if not quiet:
+                messagebox.showerror("Missing experiment", "Select a logs/<name> folder.")
+            return False
+        try:
+            p = Path(raw).expanduser().resolve()
+        except Exception:
+            if not quiet:
+                messagebox.showerror("Invalid path", f"Cannot resolve:\n{raw}")
+            return False
+        if not p.is_dir():
+            if not quiet:
+                messagebox.showerror("Invalid experiment", f"Not a folder:\n{p}")
+            return False
+        name = self.exp_name(str(p))
+        if not name:
+            if not quiet:
+                messagebox.showerror("Invalid experiment", "Could not derive experiment name.")
+            return False
+        parts = p.parts
+        under_logs = len(parts) >= 2 and parts[-2].lower() == "logs"
+        if not under_logs and not quiet:
+            messagebox.showwarning(
+                "Warning",
+                "Selected folder is not under logs/. Using the folder name as the experiment name.",
+            )
+
+        was = self._suppress_autosave
+        self._suppress_autosave = True
+        try:
+            self.active_exp_path.set(str(p))
+            self.pp_exp_dir.set(str(p))
+            self.f0_exp.set(name)
+            self.hb_exp.set(name)
+            self.tr_exp.set(name)
+            self.ix_exp.set(name)
+            self.ab_out_dir.set(str(p / "infer_ab_test"))
+            self.im_infer_output_dir.set(str(p / "infer_long"))
+            self.im_merge_output_dir.set(str(p / "merged"))
+            self._refresh_im_auto_paths()
+            self.exp_locked = bool(lock)
+            self._set_exp_widgets_locked(self.exp_locked)
+        finally:
+            self._suppress_autosave = was
+        self._save_settings()
+        return True
+
+    def _clear_active_experiment(self) -> None:
+        was = self._suppress_autosave
+        self._suppress_autosave = True
+        try:
+            self.exp_locked = False
+            self.active_exp_path.set("")
+            self._set_exp_widgets_locked(False)
+        finally:
+            self._suppress_autosave = was
+        self._save_settings()
+
+    def _browse_active_exp(self) -> None:
+        root = self._configured_root()
+        fallback = str(root / "logs") if root else None
+        path = filedialog.askdirectory(
+            title="Select experiment folder (logs/<name>)",
+            **self._path_dialog_opts(self.active_exp_path.get(), fallback=fallback),
+        )
+        if path:
+            self._apply_active_experiment(path, lock=True)
 
     # ------------------------------------------------------------------
     # Settings persistence
@@ -449,6 +557,8 @@ class App:
             "geometry": self.root.geometry(),
             "last_tab": self.notebook.index(self.notebook.select()) if hasattr(self, "notebook") else 0,
             "rvc_root": self.rvc_root.get(),
+            "active_exp_path": self.active_exp_path.get(),
+            "exp_locked": self.exp_locked,
             "pp_inp_root": self.pp_inp_root.get(),
             "pp_exp_dir": self.pp_exp_dir.get(),
             "pp_sr": self.pp_sr.get(),
@@ -536,6 +646,7 @@ class App:
 
         str_vars = {
             "rvc_root": self.rvc_root,
+            "active_exp_path": self.active_exp_path,
             "pp_inp_root": self.pp_inp_root,
             "pp_exp_dir": self.pp_exp_dir,
             "pp_sr": self.pp_sr,
@@ -635,6 +746,13 @@ class App:
         self.root.after(50, lambda: self.notebook.select(last_i))
 
         self._refresh_im_auto_paths()
+        want_lock = bool(data.get("exp_locked", False))
+        active = self.active_exp_path.get().strip()
+        if want_lock and active:
+            self._apply_active_experiment(active, lock=True, quiet=True)
+        else:
+            self.exp_locked = False
+            self._set_exp_widgets_locked(False)
         self._suppress_autosave = False
 
     def _save_settings(self) -> None:
@@ -652,6 +770,7 @@ class App:
     def _wire_autosave(self) -> None:
         vars_to_trace: list[tk.Variable] = [
             self.rvc_root,
+            self.active_exp_path,
             self.pp_inp_root,
             self.pp_exp_dir,
             self.pp_sr,
@@ -801,10 +920,13 @@ class App:
         var: tk.StringVar,
         browse: Callable[[], None],
         browse_label: str = "Browse",
-    ) -> None:
+    ) -> tuple[ttk.Entry, ttk.Button]:
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(parent, textvariable=var).grid(row=row, column=1, columnspan=3, sticky="ew", pady=4)
-        ttk.Button(parent, text=browse_label, command=browse).grid(row=row, column=4, padx=(8, 0), pady=4)
+        entry = ttk.Entry(parent, textvariable=var)
+        entry.grid(row=row, column=1, columnspan=3, sticky="ew", pady=4)
+        btn = ttk.Button(parent, text=browse_label, command=browse)
+        btn.grid(row=row, column=4, padx=(8, 0), pady=4)
+        return entry, btn
 
     def _path_dialog_opts(
         self,
@@ -902,6 +1024,30 @@ class App:
             row=2, column=0, columnspan=5, sticky="w", pady=(8, 0)
         )
 
+        exp = ttk.LabelFrame(parent, text="Active experiment", padding=10)
+        exp.pack(fill="x", padx=4, pady=4)
+        self._configure_cols(exp)
+        ttk.Label(exp, text="Experiment").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        self.active_exp_entry = ttk.Entry(exp, textvariable=self.active_exp_path, state="readonly")
+        self.active_exp_entry.grid(row=0, column=1, columnspan=2, sticky="ew", pady=4)
+        exp_btns = ttk.Frame(exp)
+        exp_btns.grid(row=0, column=3, columnspan=2, sticky="e", pady=4)
+        ttk.Button(exp_btns, text="Browse", command=self._browse_active_exp).pack(
+            side="left", padx=2
+        )
+        ttk.Button(exp_btns, text="Clear", command=self._clear_active_experiment).pack(
+            side="left", padx=2
+        )
+        ttk.Label(
+            exp,
+            text=(
+                "Browse logs/<exp_name> (e.g. logs/cx_20260802). "
+                "Fills Exp fields on all tabs and locks them until Clear."
+            ),
+            wraplength=900,
+            justify="left",
+        ).grid(row=1, column=0, columnspan=5, sticky="w", pady=(8, 0))
+
         ttk.Label(
             parent,
             text=f"Settings file: {SETTINGS_PATH}",
@@ -948,7 +1094,10 @@ class App:
         self._configure_cols(f)
 
         self._row_path(f, 0, "Input audio dir", self.pp_inp_root, self._browse_pp_inp)
-        self._row_path(f, 1, "Exp dir", self.pp_exp_dir, self._browse_pp_exp, "Browse")
+        pp_exp_entry, pp_exp_btn = self._row_path(
+            f, 1, "Exp dir", self.pp_exp_dir, self._browse_pp_exp, "Browse"
+        )
+        self._register_exp_lock_widgets(pp_exp_entry, pp_exp_btn)
 
         ttk.Label(f, text="Sample rate").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Combobox(
@@ -1007,6 +1156,8 @@ class App:
             self.pp_inp_root.set(path)
 
     def _browse_pp_exp(self) -> None:
+        if self.exp_locked:
+            return
         path = filedialog.askdirectory(
             title="Select experiment folder",
             **self._path_dialog_opts(self.pp_exp_dir.get()),
@@ -1021,7 +1172,9 @@ class App:
         f.pack(fill="x", padx=4, pady=4)
         self._configure_cols(f)
         ttk.Label(f, text="Exp name").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(f, textvariable=self.f0_exp).grid(row=0, column=1, sticky="ew", pady=4)
+        f0_exp_entry = ttk.Entry(f, textvariable=self.f0_exp)
+        f0_exp_entry.grid(row=0, column=1, sticky="ew", pady=4)
+        self._register_exp_lock_widgets(f0_exp_entry)
         ttk.Label(f, text="GPU id").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Entry(f, textvariable=self.f0_gpu, width=8).grid(row=1, column=1, sticky="w", pady=4)
         ttk.Checkbutton(f, text="is_half", variable=self.f0_is_half).grid(row=2, column=1, sticky="w", pady=4)
@@ -1038,7 +1191,9 @@ class App:
         f.pack(fill="x", padx=4, pady=4)
         self._configure_cols(f)
         ttk.Label(f, text="Exp name").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(f, textvariable=self.hb_exp).grid(row=0, column=1, sticky="ew", pady=4)
+        hb_exp_entry = ttk.Entry(f, textvariable=self.hb_exp)
+        hb_exp_entry.grid(row=0, column=1, sticky="ew", pady=4)
+        self._register_exp_lock_widgets(hb_exp_entry)
         ttk.Label(f, text="GPU id").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Entry(f, textvariable=self.hb_gpu, width=8).grid(row=1, column=1, sticky="w", pady=4)
         ttk.Label(f, text="Version").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
@@ -1060,7 +1215,9 @@ class App:
         self._configure_cols(f)
 
         ttk.Label(f, text="Exp name").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(f, textvariable=self.tr_exp).grid(row=0, column=1, sticky="ew", pady=4)
+        tr_exp_entry = ttk.Entry(f, textvariable=self.tr_exp)
+        tr_exp_entry.grid(row=0, column=1, sticky="ew", pady=4)
+        self._register_exp_lock_widgets(tr_exp_entry)
 
         ttk.Label(f, text="Sample rate").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Combobox(
@@ -1127,7 +1284,9 @@ class App:
         self._configure_cols(f)
 
         ttk.Label(f, text="Exp name").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(f, textvariable=self.ix_exp).grid(row=0, column=1, sticky="ew", pady=4)
+        ix_exp_entry = ttk.Entry(f, textvariable=self.ix_exp)
+        ix_exp_entry.grid(row=0, column=1, sticky="ew", pady=4)
+        self._register_exp_lock_widgets(ix_exp_entry)
         ttk.Label(f, text="Version").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Combobox(
             f, textvariable=self.ix_version, values=["v1", "v2"], width=8, state="readonly"
@@ -1159,7 +1318,10 @@ class App:
         self._row_path(f, 0, "Test audio", self.ab_input, self._browse_ab_input)
         self._row_path(f, 1, "Weights dir", self.ab_weights_dir, self._browse_ab_weights_dir)
         self._row_path(f, 2, "Index (opt)", self.ab_index, self._browse_ab_index)
-        self._row_path(f, 3, "Output dir", self.ab_out_dir, self._browse_ab_out_dir)
+        ab_out_entry, ab_out_btn = self._row_path(
+            f, 3, "Output dir", self.ab_out_dir, self._browse_ab_out_dir
+        )
+        self._register_exp_lock_widgets(ab_out_entry, ab_out_btn)
 
         ttk.Label(f, text="Filter").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Entry(f, textvariable=self.ab_filter).grid(row=4, column=1, sticky="ew", pady=4)
@@ -1262,6 +1424,8 @@ class App:
             self.ab_index.set(path)
 
     def _browse_ab_out_dir(self) -> None:
+        if self.exp_locked:
+            return
         path = filedialog.askdirectory(
             title="Select infer output folder",
             **self._path_dialog_opts(self.ab_out_dir.get()),
@@ -1425,9 +1589,10 @@ class App:
         self._row_path(infer, 0, "model (.pth)", self.im_model_path, self._browse_im_model)
         self._row_path(infer, 1, "index (.index)", self.im_index_path, self._browse_im_index)
         self._row_path(infer, 2, "input_path", self.im_input_path, self._browse_im_input)
-        self._row_path(
+        im_out_entry, im_out_btn = self._row_path(
             infer, 3, "infer_output_dir", self.im_infer_output_dir, self._browse_im_infer_out_dir
         )
+        self._register_exp_lock_widgets(im_out_entry, im_out_btn)
         self._row_readonly(infer, 4, "opt_path", self.im_opt_path)
         self._row_readonly(infer, 5, "model_name", self.im_model_name)
 
@@ -1505,9 +1670,10 @@ class App:
 
         self._row_path(merge, 0, "infer_result", self.im_infer_result, self._browse_im_infer_result)
         self._row_path(merge, 1, "bgm_path", self.im_bgm_path, self._browse_im_bgm)
-        self._row_path(
+        im_merge_entry, im_merge_btn = self._row_path(
             merge, 2, "merge_output_dir", self.im_merge_output_dir, self._browse_im_merge_out_dir
         )
+        self._register_exp_lock_widgets(im_merge_entry, im_merge_btn)
         self._row_readonly(merge, 3, "merge_output_path", self.im_merge_output_path)
 
         self.im_merge_btn = ttk.Button(merge, text="Start Merge", command=self.run_merge)
@@ -1583,6 +1749,8 @@ class App:
             self._refresh_im_auto_paths()
 
     def _browse_im_infer_out_dir(self) -> None:
+        if self.exp_locked:
+            return
         path = filedialog.askdirectory(
             title="Select infer output folder",
             **self._path_dialog_opts(self.im_infer_output_dir.get()),
@@ -1611,6 +1779,8 @@ class App:
             self.im_bgm_path.set(path)
 
     def _browse_im_merge_out_dir(self) -> None:
+        if self.exp_locked:
+            return
         path = filedialog.askdirectory(
             title="Select merge output folder",
             **self._path_dialog_opts(self.im_merge_output_dir.get()),
