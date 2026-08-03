@@ -58,6 +58,29 @@ TAB_NAMES = [
     "Infer + Merge",
 ]
 
+BASE_TITLE = "RVC Pipeline"
+
+# Progress lines emitted by our scripts / RVC train & extract helpers.
+_RE_PROGRESS_FRAC = re.compile(
+    r"(?:"
+    r"\[progress\]\s*(\d+)\s*/\s*(\d+)"
+    r"|进度[：:]\s*(\d+)\s*/\s*(\d+)"
+    r"|Write progress:\s*(\d+)\s*/\s*(\d+)"
+    r"|写入进度[：:]\s*(\d+)\s*/\s*(\d+)"
+    r"|\[Infer\]\s*\((\d+)\s*/\s*(\d+)\)"
+    r")",
+    re.IGNORECASE,
+)
+_RE_TRAIN_EPOCH_PCT = re.compile(
+    r"(?:训练轮次|Train(?:ing)?\s*epoch)[：:\s]+(\d+)\s*\[(\d+(?:\.\d+)?)%\]",
+    re.IGNORECASE,
+)
+_RE_DURATION_SEC = re.compile(r"duration_sec=([\d.]+)")
+_RE_CHUNK_START = re.compile(
+    r"\[chunk\s+(\d+)\]\s+start=([\d.]+)s",
+    re.IGNORECASE,
+)
+
 
 # ---------------------------------------------------------------------------
 # Theme helpers
@@ -209,7 +232,7 @@ class ScrollableFrame(ttk.Frame):
 class App:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("RVC Pipeline")
+        self.root.title(BASE_TITLE)
         self.root.geometry("1080x780")
         self.root.minsize(800, 560)
 
@@ -224,6 +247,9 @@ class App:
         self._persist_trace_ids: list[str] = []
         self._suppress_autosave = False
         self._playback = None  # sounddevice stream / data handle
+        self._job_pct: float | None = None
+        self._job_total_epoch: int | None = None
+        self._job_audio_duration: float | None = None
 
         # --- shared / settings ---
         self.rvc_root = tk.StringVar(value="")
@@ -780,6 +806,58 @@ class App:
         ttk.Entry(parent, textvariable=var).grid(row=row, column=1, columnspan=3, sticky="ew", pady=4)
         ttk.Button(parent, text=browse_label, command=browse).grid(row=row, column=4, padx=(8, 0), pady=4)
 
+    def _path_dialog_opts(
+        self,
+        current: str,
+        *,
+        for_file: bool = False,
+        fallback: str | Path | None = None,
+    ) -> dict[str, str]:
+        """Open the file/dir dialog at this field's current path (not last process pick)."""
+        opts: dict[str, str] = {}
+        candidates: list[Path] = []
+        raw = (current or "").strip().strip('"')
+        if raw:
+            p = Path(raw).expanduser()
+            if not p.is_absolute():
+                root = self._configured_root()
+                if root is not None:
+                    p = root / p
+            candidates.append(p)
+        if fallback:
+            candidates.append(Path(fallback))
+
+        for p in candidates:
+            try:
+                if for_file:
+                    if p.is_file():
+                        opts["initialdir"] = str(p.parent)
+                        opts["initialfile"] = p.name
+                        return opts
+                    if p.is_dir():
+                        opts["initialdir"] = str(p)
+                        return opts
+                    parent = p.parent
+                    if parent.is_dir():
+                        opts["initialdir"] = str(parent)
+                        if p.name:
+                            opts["initialfile"] = p.name
+                        return opts
+                else:
+                    if p.is_dir():
+                        opts["initialdir"] = str(p)
+                        return opts
+                    if p.exists() and p.parent.is_dir():
+                        opts["initialdir"] = str(p.parent)
+                        return opts
+                    parent = p.parent
+                    if parent.is_dir():
+                        opts["initialdir"] = str(parent)
+                        return opts
+            except OSError:
+                continue
+        return opts
+
     def _row_entry(
         self,
         parent: tk.Misc,
@@ -837,7 +915,10 @@ class App:
         self._fill_empty_defaults_from_root()
 
     def _browse_rvc_root(self) -> None:
-        path = filedialog.askdirectory(title="Select RVC root folder")
+        path = filedialog.askdirectory(
+            title="Select RVC root folder",
+            **self._path_dialog_opts(self.rvc_root.get()),
+        )
         if path:
             self.rvc_root.set(path)
             if not looks_like_rvc_root(Path(path)):
@@ -918,12 +999,18 @@ class App:
         ttk.Entry(norm, textvariable=self.pp_peak_reject, width=10).grid(row=0, column=5, sticky="w", pady=3)
 
     def _browse_pp_inp(self) -> None:
-        path = filedialog.askdirectory(title="Select input audio folder")
+        path = filedialog.askdirectory(
+            title="Select input audio folder",
+            **self._path_dialog_opts(self.pp_inp_root.get()),
+        )
         if path:
             self.pp_inp_root.set(path)
 
     def _browse_pp_exp(self) -> None:
-        path = filedialog.askdirectory(title="Select experiment folder")
+        path = filedialog.askdirectory(
+            title="Select experiment folder",
+            **self._path_dialog_opts(self.pp_exp_dir.get()),
+        )
         if path:
             self.pp_exp_dir.set(path)
 
@@ -1015,12 +1102,20 @@ class App:
         )
 
     def _browse_pretrain_g(self) -> None:
-        path = filedialog.askopenfilename(title="Select generator pretrained", filetypes=PTH_FILETYPES)
+        path = filedialog.askopenfilename(
+            title="Select generator pretrained",
+            filetypes=PTH_FILETYPES,
+            **self._path_dialog_opts(self.tr_pretrain_g.get(), for_file=True),
+        )
         if path:
             self.tr_pretrain_g.set(path)
 
     def _browse_pretrain_d(self) -> None:
-        path = filedialog.askopenfilename(title="Select discriminator pretrained", filetypes=PTH_FILETYPES)
+        path = filedialog.askopenfilename(
+            title="Select discriminator pretrained",
+            filetypes=PTH_FILETYPES,
+            **self._path_dialog_opts(self.tr_pretrain_d.get(), for_file=True),
+        )
         if path:
             self.tr_pretrain_d.set(path)
 
@@ -1047,7 +1142,10 @@ class App:
         ).grid(row=4, column=0, columnspan=5, sticky="w", pady=(8, 0))
 
     def _browse_ix_outside(self) -> None:
-        path = filedialog.askdirectory(title="Select outside index directory")
+        path = filedialog.askdirectory(
+            title="Select outside index directory",
+            **self._path_dialog_opts(self.ix_outside.get()),
+        )
         if path:
             self.ix_outside.set(path)
 
@@ -1137,12 +1235,19 @@ class App:
         ttk.Button(rbtns, text="Stop", command=self._stop_playback).pack(side="left", padx=2)
 
     def _browse_ab_input(self) -> None:
-        path = filedialog.askopenfilename(title="Select test audio", filetypes=AUDIO_FILETYPES)
+        path = filedialog.askopenfilename(
+            title="Select test audio",
+            filetypes=AUDIO_FILETYPES,
+            **self._path_dialog_opts(self.ab_input.get(), for_file=True),
+        )
         if path:
             self.ab_input.set(path)
 
     def _browse_ab_weights_dir(self) -> None:
-        path = filedialog.askdirectory(title="Select weights folder")
+        path = filedialog.askdirectory(
+            title="Select weights folder",
+            **self._path_dialog_opts(self.ab_weights_dir.get()),
+        )
         if path:
             self.ab_weights_dir.set(path)
             self._refresh_weights_list()
@@ -1151,12 +1256,16 @@ class App:
         path = filedialog.askopenfilename(
             title="Select index file",
             filetypes=[("Index Files", "*.index"), ("All Files", "*.*")],
+            **self._path_dialog_opts(self.ab_index.get(), for_file=True),
         )
         if path:
             self.ab_index.set(path)
 
     def _browse_ab_out_dir(self) -> None:
-        path = filedialog.askdirectory(title="Select infer output folder")
+        path = filedialog.askdirectory(
+            title="Select infer output folder",
+            **self._path_dialog_opts(self.ab_out_dir.get()),
+        )
         if path:
             self.ab_out_dir.set(path)
 
@@ -1422,11 +1531,13 @@ class App:
 
     def _browse_im_model(self) -> None:
         root = self._configured_root()
-        initial = str(root / "assets" / "weights") if root else None
+        fallback = str(root / "assets" / "weights") if root else None
         path = filedialog.askopenfilename(
             title="Select model .pth",
-            initialdir=initial,
             filetypes=PTH_FILETYPES,
+            **self._path_dialog_opts(
+                self.im_model_path.get(), for_file=True, fallback=fallback
+            ),
         )
         if not path:
             return
@@ -1437,11 +1548,13 @@ class App:
 
     def _browse_im_index(self) -> None:
         root = self._configured_root()
-        initial = str(root / "assets" / "indices") if root else None
+        fallback = str(root / "assets" / "indices") if root else None
         path = filedialog.askopenfilename(
             title="Select index file",
-            initialdir=initial,
             filetypes=[("FAISS index", "*.index"), ("All Files", "*.*")],
+            **self._path_dialog_opts(
+                self.im_index_path.get(), for_file=True, fallback=fallback
+            ),
         )
         if path:
             self.im_index_path.set(path)
@@ -1460,30 +1573,48 @@ class App:
         self.im_index_path.set(found or "")
 
     def _browse_im_input(self) -> None:
-        path = filedialog.askopenfilename(title="Select input audio", filetypes=AUDIO_FILETYPES)
+        path = filedialog.askopenfilename(
+            title="Select input audio",
+            filetypes=AUDIO_FILETYPES,
+            **self._path_dialog_opts(self.im_input_path.get(), for_file=True),
+        )
         if path:
             self.im_input_path.set(path)
             self._refresh_im_auto_paths()
 
     def _browse_im_infer_out_dir(self) -> None:
-        path = filedialog.askdirectory(title="Select infer output folder")
+        path = filedialog.askdirectory(
+            title="Select infer output folder",
+            **self._path_dialog_opts(self.im_infer_output_dir.get()),
+        )
         if path:
             self.im_infer_output_dir.set(path)
             self._refresh_im_auto_paths()
 
     def _browse_im_infer_result(self) -> None:
-        path = filedialog.askopenfilename(title="Select infer result", filetypes=AUDIO_FILETYPES)
+        path = filedialog.askopenfilename(
+            title="Select infer result",
+            filetypes=AUDIO_FILETYPES,
+            **self._path_dialog_opts(self.im_infer_result.get(), for_file=True),
+        )
         if path:
             self.im_infer_result.set(path)
             self._refresh_im_merge_output_path()
 
     def _browse_im_bgm(self) -> None:
-        path = filedialog.askopenfilename(title="Select BGM audio", filetypes=AUDIO_FILETYPES)
+        path = filedialog.askopenfilename(
+            title="Select BGM audio",
+            filetypes=AUDIO_FILETYPES,
+            **self._path_dialog_opts(self.im_bgm_path.get(), for_file=True),
+        )
         if path:
             self.im_bgm_path.set(path)
 
     def _browse_im_merge_out_dir(self) -> None:
-        path = filedialog.askdirectory(title="Select merge output folder")
+        path = filedialog.askdirectory(
+            title="Select merge output folder",
+            **self._path_dialog_opts(self.im_merge_output_dir.get()),
+        )
         if path:
             self.im_merge_output_dir.set(path)
             self._refresh_im_merge_output_path()
@@ -1529,6 +1660,69 @@ class App:
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
+    def _reset_job_progress(self) -> None:
+        self._job_pct = None
+        self._job_total_epoch = None
+        self._job_audio_duration = None
+
+    def _set_window_progress(self, pct: float | None) -> None:
+        if pct is None:
+            self._job_pct = None
+            self.root.title(BASE_TITLE)
+            return
+        pct = max(0.0, min(100.0, float(pct)))
+        # Avoid flickering the taskbar title on tiny updates.
+        if self._job_pct is not None and abs(pct - self._job_pct) < 0.4:
+            return
+        self._job_pct = pct
+        shown = int(round(pct))
+        self.root.title(f"{BASE_TITLE} — {shown}%")
+        if self.running:
+            self.status_var.set(f"Running… {shown}%")
+
+    def _parse_progress_from_line(self, line: str) -> None:
+        m = _RE_DURATION_SEC.search(line)
+        if m:
+            try:
+                self._job_audio_duration = float(m.group(1))
+            except ValueError:
+                pass
+
+        m = _RE_PROGRESS_FRAC.search(line)
+        if m:
+            groups = [g for g in m.groups() if g is not None]
+            if len(groups) >= 2:
+                try:
+                    cur, total = int(groups[0]), int(groups[1])
+                    if total > 0:
+                        self._set_window_progress(100.0 * cur / total)
+                        return
+                except ValueError:
+                    pass
+
+        m = _RE_TRAIN_EPOCH_PCT.search(line)
+        if m:
+            try:
+                epoch = int(m.group(1))
+                batch_pct = float(m.group(2))
+                total = self._job_total_epoch
+                if total and total > 0:
+                    overall = ((epoch - 1) + batch_pct / 100.0) / total * 100.0
+                    self._set_window_progress(overall)
+                else:
+                    self._set_window_progress(batch_pct)
+                return
+            except ValueError:
+                pass
+
+        m = _RE_CHUNK_START.search(line)
+        if m and self._job_audio_duration and self._job_audio_duration > 0:
+            try:
+                start = float(m.group(2))
+                self._set_window_progress(100.0 * start / self._job_audio_duration)
+            except ValueError:
+                pass
+
     def _drain_log_queue(self) -> None:
         while True:
             try:
@@ -1536,6 +1730,9 @@ class App:
             except queue.Empty:
                 break
             self._append_log(msg)
+            if self.running:
+                for line in msg.splitlines():
+                    self._parse_progress_from_line(line)
         self.root.after(80, self._drain_log_queue)
 
     def _set_running(self, running: bool) -> None:
@@ -1546,8 +1743,13 @@ class App:
             st = "disabled" if running else "normal"
             self.im_infer_btn.config(state=st)
             self.im_merge_btn.config(state=st)
-        self.status_var.set("Running…" if running else "Idle")
-        if not running:
+        if running:
+            self._set_window_progress(0.0)
+            self.status_var.set("Running… 0%")
+        else:
+            self._reset_job_progress()
+            self.root.title(BASE_TITLE)
+            self.status_var.set("Idle")
             self._update_global_start_state()
 
     def _on_tab_changed(self, _event: tk.Event | None = None) -> None:
@@ -1598,6 +1800,7 @@ class App:
         self.log_queue.put("\n[stop] killing process tree…\n")
         self._kill_process()
         self.status_var.set("Stopping…")
+        self.root.title(f"{BASE_TITLE} — stopping")
 
     def _run_cmd(
         self,
@@ -1605,6 +1808,7 @@ class App:
         rvc_root: Path,
         on_success: Callable[[], None] | None = None,
         env_extra: dict[str, str] | None = None,
+        total_epoch: int | None = None,
     ) -> None:
         if self.running:
             messagebox.showwarning("Busy", "Wait for the current job to finish, or Stop it.")
@@ -1650,6 +1854,9 @@ class App:
                 self.proc = None
                 self.root.after(0, lambda: self._set_running(False))
 
+        self._reset_job_progress()
+        if total_epoch is not None and total_epoch > 0:
+            self._job_total_epoch = total_epoch
         self._set_running(True)
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1688,7 +1895,13 @@ class App:
         on_success = None
         if idx == TAB_INFER_AB:
             on_success = self._reload_ab_results
-        self._run_cmd(cmd, root, on_success=on_success)
+        total_epoch = None
+        if idx == TAB_TRAIN:
+            try:
+                total_epoch = max(1, int(self.tr_total_epoch.get().strip() or "200"))
+            except ValueError:
+                total_epoch = 200
+        self._run_cmd(cmd, root, on_success=on_success, total_epoch=total_epoch)
 
     def _cmd_preprocess(self, root: Path) -> list[str] | None:
         inp = self.pp_inp_root.get().strip()
@@ -2013,7 +2226,22 @@ class App:
         ]
 
         def on_success() -> None:
-            messagebox.showinfo("Merge done", f"Output:\n{merge_out}")
+            note = ""
+            try:
+                infer_path = Path(infer_result)
+                merge_path = Path(merge_out)
+                if (
+                    infer_path.is_file()
+                    and merge_path.is_file()
+                    and infer_path.resolve() != merge_path.resolve()
+                ):
+                    infer_path.unlink()
+                    note = f"\n\nDeleted infer result:\n{infer_result}"
+                    self.log_queue.put(f"[merge] deleted infer result: {infer_result}\n")
+            except OSError as exc:
+                note = f"\n\nCould not delete infer result:\n{exc}"
+                self.log_queue.put(f"[merge] delete infer result failed: {exc}\n")
+            messagebox.showinfo("Merge done", f"Output:\n{merge_out}{note}")
 
         self._run_cmd(cmd, root, on_success=on_success)
 

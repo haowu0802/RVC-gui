@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -205,9 +206,10 @@ def main(argv: list[str] | None = None) -> int:
         temp_root = Path(tempfile.mkdtemp(prefix="rvc_long_"))
         cleanup_temp = True
 
+    n_chunks = max(1, int(math.ceil(max(duration - args.overlap_sec, 1e-6) / step_sec)))
     print(
         f"[info] duration_sec={duration:.2f} chunk_sec={args.chunk_sec} "
-        f"overlap_sec={args.overlap_sec}",
+        f"overlap_sec={args.overlap_sec} chunks={n_chunks}",
         flush=True,
     )
     print(f"[info] temp_dir={temp_root}", flush=True)
@@ -222,6 +224,7 @@ def main(argv: list[str] | None = None) -> int:
             chunk_in = temp_root / f"chunk_in_{idx:04d}.wav"
             extract_chunk_to_wav(input_path, str(chunk_in), start, this_dur)
             print(
+                f"[progress] {idx + 1}/{n_chunks} | "
                 f"[chunk {idx:04d}] start={start:.2f}s dur={this_dur:.2f}s",
                 flush=True,
             )
