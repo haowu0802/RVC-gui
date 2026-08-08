@@ -30,6 +30,11 @@ from rvc_env import (
     resolve_rvc_root,
     rvc_python,
 )
+from train_metrics import (
+    find_weight_files,
+    merge_metrics_with_weights,
+    parse_train_log,
+)
 
 AUDIO_FILETYPES = [
     ("Audio Files", "*.wav *.flac *.mp3 *.m4a *.ogg *.aac"),
@@ -43,9 +48,11 @@ TAB_PREPROCESS = 1
 TAB_EXTRACT_F0 = 2
 TAB_EXTRACT_HUBERT = 3
 TAB_TRAIN = 4
-TAB_BUILD_INDEX = 5
-TAB_INFER_AB = 6
-TAB_INFER_MERGE = 7
+TAB_METRICS = 5
+TAB_BUILD_INDEX = 6
+TAB_INFER_AB = 7
+TAB_SEPARATE = 8
+TAB_INFER_MERGE = 9
 
 TAB_NAMES = [
     "Settings",
@@ -53,10 +60,19 @@ TAB_NAMES = [
     "Extract F0",
     "Extract HuBERT",
     "Train",
+    "Train Metrics",
     "Build Index",
     "Infer A/B",
+    "Separate",
     "Infer + Merge",
 ]
+
+SEP_MODELS = {
+    "MelBand-RoFormer (recommended)": "vocals_mel_band_roformer.ckpt",
+    "BS-RoFormer": "model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+}
+DEFAULT_SEP_MODEL_DIR = PACKAGE_DIR / "models"
+DEFAULT_SEP_VENV = PACKAGE_DIR / ".venv"
 
 BASE_TITLE = "RVC Pipeline"
 
@@ -351,6 +367,17 @@ class App:
         self.im_merge_output_dir = tk.StringVar(value="")
         self.im_merge_output_path = tk.StringVar(value="")
 
+        # --- separate (audio-separator / MelBand-RoFormer) ---
+        self.sep_input_path = tk.StringVar(value="")
+        self.sep_output_dir = tk.StringVar(value="")
+        self.sep_model_label = tk.StringVar(value=next(iter(SEP_MODELS)))
+        self.sep_format = tk.StringVar(value="FLAC")
+        self.sep_segment = tk.StringVar(value="256")
+        self.sep_model_dir = tk.StringVar(value=str(DEFAULT_SEP_MODEL_DIR))
+        self.sep_venv_dir = tk.StringVar(value=str(DEFAULT_SEP_VENV))
+        self.sep_proxy = tk.StringVar(value="")
+        self.sep_fill_infer_merge = tk.BooleanVar(value=True)
+
         self._build_ui()
         self._load_settings()
         self._wire_autosave()
@@ -443,8 +470,6 @@ class App:
             self.ab_out_dir.set(str(root / "logs" / "my_exp" / "infer_ab_test"))
         if not self.im_infer_output_dir.get().strip():
             self.im_infer_output_dir.set(str(root / "logs" / "my_exp" / "infer_long"))
-        if not self.im_merge_output_dir.get().strip():
-            self.im_merge_output_dir.set(str(root / "logs" / "my_exp" / "merged"))
 
     def _register_exp_lock_widgets(self, *widgets: tk.Widget) -> None:
         for w in widgets:
@@ -516,9 +541,10 @@ class App:
             self.hb_exp.set(name)
             self.tr_exp.set(name)
             self.ix_exp.set(name)
+            if hasattr(self, "metrics_exp"):
+                self.metrics_exp.set(name)
             self.ab_out_dir.set(str(p / "infer_ab_test"))
             self.im_infer_output_dir.set(str(p / "infer_long"))
-            self.im_merge_output_dir.set(str(p / "merged"))
             self._refresh_im_auto_paths()
             self.exp_locked = bool(lock)
             self._set_exp_widgets_locked(self.exp_locked)
@@ -632,6 +658,15 @@ class App:
             "im_infer_result": self.im_infer_result.get(),
             "im_bgm_path": self.im_bgm_path.get(),
             "im_merge_output_dir": self.im_merge_output_dir.get(),
+            "sep_input_path": self.sep_input_path.get(),
+            "sep_output_dir": self.sep_output_dir.get(),
+            "sep_model_label": self.sep_model_label.get(),
+            "sep_format": self.sep_format.get(),
+            "sep_segment": self.sep_segment.get(),
+            "sep_model_dir": self.sep_model_dir.get(),
+            "sep_venv_dir": self.sep_venv_dir.get(),
+            "sep_proxy": self.sep_proxy.get(),
+            "sep_fill_infer_merge": self.sep_fill_infer_merge.get(),
         }
 
     def _load_settings(self) -> None:
@@ -712,6 +747,14 @@ class App:
             "im_infer_result": self.im_infer_result,
             "im_bgm_path": self.im_bgm_path,
             "im_merge_output_dir": self.im_merge_output_dir,
+            "sep_input_path": self.sep_input_path,
+            "sep_output_dir": self.sep_output_dir,
+            "sep_model_label": self.sep_model_label,
+            "sep_format": self.sep_format,
+            "sep_segment": self.sep_segment,
+            "sep_model_dir": self.sep_model_dir,
+            "sep_venv_dir": self.sep_venv_dir,
+            "sep_proxy": self.sep_proxy,
         }
         bool_vars = {
             "pp_noparallel": self.pp_noparallel,
@@ -722,6 +765,7 @@ class App:
             "tr_save_latest_only": self.tr_save_latest_only,
             "tr_cache_in_gpu": self.tr_cache_in_gpu,
             "tr_save_every_weights": self.tr_save_every_weights,
+            "sep_fill_infer_merge": self.sep_fill_infer_merge,
         }
         for key, var in str_vars.items():
             if key in data and data[key] is not None:
@@ -844,6 +888,15 @@ class App:
             self.im_infer_result,
             self.im_bgm_path,
             self.im_merge_output_dir,
+            self.sep_input_path,
+            self.sep_output_dir,
+            self.sep_model_label,
+            self.sep_format,
+            self.sep_segment,
+            self.sep_model_dir,
+            self.sep_venv_dir,
+            self.sep_proxy,
+            self.sep_fill_infer_merge,
         ]
         for var in vars_to_trace:
             tid = var.trace_add("write", lambda *_a: self._save_settings())
@@ -874,8 +927,10 @@ class App:
             self._build_tab_extract_f0,
             self._build_tab_extract_hubert,
             self._build_tab_train,
+            self._build_tab_train_metrics,
             self._build_tab_build_index,
             self._build_tab_infer_ab,
+            self._build_tab_separate,
             self._build_tab_infer_merge,
         ]
         for name, builder in zip(TAB_NAMES, builders):
@@ -1048,6 +1103,27 @@ class App:
             justify="left",
         ).grid(row=1, column=0, columnspan=5, sticky="w", pady=(8, 0))
 
+        sep = ttk.LabelFrame(parent, text="Audio separator (Separate tab)", padding=10)
+        sep.pack(fill="x", padx=4, pady=4)
+        self._configure_cols(sep)
+        self._row_path(sep, 0, "Separator venv", self.sep_venv_dir, self._browse_sep_venv)
+        self._row_path(sep, 1, "Model dir", self.sep_model_dir, self._browse_sep_model_dir)
+        ttk.Label(sep, text="Proxy (optional)").grid(
+            row=2, column=0, sticky="w", padx=(0, 8), pady=4
+        )
+        ttk.Entry(sep, textvariable=self.sep_proxy).grid(
+            row=2, column=1, columnspan=3, sticky="ew", pady=4
+        )
+        ttk.Label(
+            sep,
+            text=(
+                f"Defaults: venv={DEFAULT_SEP_VENV}  models={DEFAULT_SEP_MODEL_DIR}. "
+                "Run setup_separator.ps1 if audio-separator is missing."
+            ),
+            wraplength=900,
+            justify="left",
+        ).grid(row=3, column=0, columnspan=5, sticky="w", pady=(8, 0))
+
         ttk.Label(
             parent,
             text=f"Settings file: {SETTINGS_PATH}",
@@ -1055,6 +1131,22 @@ class App:
         ).pack(anchor="w", padx=8, pady=8)
 
         self.rvc_root.trace_add("write", lambda *_a: self._on_rvc_root_changed())
+
+    def _browse_sep_venv(self) -> None:
+        path = filedialog.askdirectory(
+            title="Select separator venv folder (.venv)",
+            **self._path_dialog_opts(self.sep_venv_dir.get()),
+        )
+        if path:
+            self.sep_venv_dir.set(path)
+
+    def _browse_sep_model_dir(self) -> None:
+        path = filedialog.askdirectory(
+            title="Select separator model folder",
+            **self._path_dialog_opts(self.sep_model_dir.get()),
+        )
+        if path:
+            self.sep_model_dir.set(path)
 
     def _on_rvc_root_changed(self) -> None:
         self._refresh_python_display()
@@ -1276,7 +1368,158 @@ class App:
         if path:
             self.tr_pretrain_d.set(path)
 
-    # ---- Tab 5: Build Index ----
+    # ---- Tab 5: Train Metrics ----
+
+    def _build_tab_train_metrics(self, parent: ttk.Frame) -> None:
+        ctrl = ttk.LabelFrame(parent, text="Source", padding=10)
+        ctrl.pack(fill="x", padx=4, pady=4)
+        self._configure_cols(ctrl)
+
+        ttk.Label(ctrl, text="Exp name").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        self.metrics_exp = tk.StringVar(value=self.tr_exp.get() or "my_exp")
+        ttk.Entry(ctrl, textvariable=self.metrics_exp).grid(
+            row=0, column=1, sticky="ew", pady=4
+        )
+        btns = ttk.Frame(ctrl)
+        btns.grid(row=0, column=2, columnspan=3, sticky="e", pady=4)
+        ttk.Button(btns, text="Use active/train exp", command=self._metrics_use_active_exp).pack(
+            side="left", padx=2
+        )
+        ttk.Button(btns, text="Refresh", command=self._refresh_train_metrics).pack(
+            side="left", padx=2
+        )
+
+        self.metrics_status = tk.StringVar(value="Click Refresh to load train.log metrics.")
+        ttk.Label(ctrl, textvariable=self.metrics_status, wraplength=900).grid(
+            row=1, column=0, columnspan=5, sticky="w", pady=(6, 0)
+        )
+
+        opts = ttk.Frame(ctrl)
+        opts.grid(row=2, column=0, columnspan=5, sticky="w", pady=(8, 0))
+        self.metrics_only_weights = tk.BooleanVar(value=False)
+        self.metrics_sort_mel = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            opts, text="Only epochs with exported .pth", variable=self.metrics_only_weights
+        ).pack(side="left", padx=(0, 12))
+        ttk.Checkbutton(
+            opts, text="Sort by mel (low first)", variable=self.metrics_sort_mel
+        ).pack(side="left")
+
+        table = ttk.LabelFrame(parent, text="Epoch metrics (last log sample wins if resumed)", padding=6)
+        table.pack(fill="both", expand=True, padx=4, pady=4)
+        cols = ("epoch", "mel", "kl", "disc", "gen", "fm", "weight")
+        self.metrics_tree = ttk.Treeview(
+            table, columns=cols, show="headings", height=16, selectmode="browse"
+        )
+        headings = {
+            "epoch": ("Epoch", 70),
+            "mel": ("mel", 80),
+            "kl": ("kl", 80),
+            "disc": ("disc", 80),
+            "gen": ("gen", 80),
+            "fm": ("fm", 80),
+            "weight": ("weight file", 420),
+        }
+        for key, (label, width) in headings.items():
+            self.metrics_tree.heading(key, text=label)
+            self.metrics_tree.column(key, width=width, anchor="center" if key != "weight" else "w")
+        ysb = ttk.Scrollbar(table, orient="vertical", command=self.metrics_tree.yview)
+        xsb = ttk.Scrollbar(table, orient="horizontal", command=self.metrics_tree.xview)
+        self.metrics_tree.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        self.metrics_tree.grid(row=0, column=0, sticky="nsew")
+        ysb.grid(row=0, column=1, sticky="ns")
+        xsb.grid(row=1, column=0, sticky="ew")
+        table.rowconfigure(0, weight=1)
+        table.columnconfigure(0, weight=1)
+
+        tip = (
+            "mel/kl/... are sparse training-batch samples (not full-epoch averages). "
+            "Use Infer A/B to judge sound. Index does not need rebuild after epoch-only continue."
+        )
+        ttk.Label(parent, text=tip, wraplength=960).pack(anchor="w", padx=8, pady=6)
+
+        self.metrics_only_weights.trace_add("write", lambda *_a: self._refresh_train_metrics())
+        self.metrics_sort_mel.trace_add("write", lambda *_a: self._refresh_train_metrics())
+
+    def _metrics_use_active_exp(self) -> None:
+        name = self.exp_name(self.active_exp_path.get()) or self.exp_name(self.tr_exp.get())
+        if name:
+            self.metrics_exp.set(name)
+        self._refresh_train_metrics()
+
+    def _refresh_train_metrics(self) -> None:
+        if not hasattr(self, "metrics_tree"):
+            return
+        for item in self.metrics_tree.get_children():
+            self.metrics_tree.delete(item)
+
+        root = self._configured_root()
+        if root is None:
+            try:
+                root = resolve_rvc_root(self.rvc_root.get().strip() or None)
+            except FileNotFoundError:
+                self.metrics_status.set("Set RVC root first.")
+                return
+
+        exp = self.exp_name(self.metrics_exp.get()) or self.exp_name(self.tr_exp.get())
+        if not exp:
+            self.metrics_status.set("Enter an experiment name.")
+            return
+
+        log_path = root / "logs" / exp / "train.log"
+        weights_dir = root / "assets" / "weights"
+        metrics = parse_train_log(log_path)
+        weights = find_weight_files(weights_dir, exp)
+        rows = merge_metrics_with_weights(metrics, weights)
+
+        if self.metrics_only_weights.get():
+            rows = [r for r in rows if r.weight_path]
+        if self.metrics_sort_mel.get():
+            rows = sorted(
+                rows,
+                key=lambda r: (
+                    r.loss_mel != r.loss_mel,
+                    r.loss_mel if r.loss_mel == r.loss_mel else 1e9,
+                    r.epoch,
+                ),
+            )
+        else:
+            rows = sorted(rows, key=lambda r: r.epoch)
+
+        def fmt(v: float) -> str:
+            if v != v:  # NaN
+                return ""
+            return f"{v:.3f}"
+
+        for r in rows:
+            wname = Path(r.weight_path).name if r.weight_path else ""
+            self.metrics_tree.insert(
+                "",
+                "end",
+                values=(
+                    r.epoch,
+                    fmt(r.loss_mel),
+                    fmt(r.loss_kl),
+                    fmt(r.loss_disc),
+                    fmt(r.loss_gen),
+                    fmt(r.loss_fm),
+                    wname,
+                ),
+            )
+
+        with_w = sum(1 for r in rows if r.weight_path)
+        best = None
+        for r in rows:
+            if r.loss_mel == r.loss_mel and (best is None or r.loss_mel < best.loss_mel):
+                best = r
+        best_s = (
+            f" lowest mel in view: e{best.epoch}={best.loss_mel:.3f}" if best is not None else ""
+        )
+        self.metrics_status.set(
+            f"{log_path} | rows={len(rows)} weights={with_w}/{len(weights)}{best_s}"
+        )
+
+    # ---- Tab 6: Build Index ----
 
     def _build_tab_build_index(self, parent: ttk.Frame) -> None:
         f = ttk.LabelFrame(parent, text="Build FAISS index", padding=10)
@@ -1579,7 +1822,194 @@ class App:
             pass
         self._playback = None
 
-    # ---- Tab 7: Infer + Merge ----
+    # ---- Tab 8: Separate ----
+
+    def _build_tab_separate(self, parent: ttk.Frame) -> None:
+        f = ttk.LabelFrame(parent, text="Vocals + Instrumental separation", padding=10)
+        f.pack(fill="x", padx=4, pady=4)
+        self._configure_cols(f)
+
+        self._row_path(f, 0, "input_path", self.sep_input_path, self._browse_sep_input)
+        self._row_path(f, 1, "output_dir", self.sep_output_dir, self._browse_sep_output)
+
+        ttk.Label(f, text="Model").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Combobox(
+            f,
+            textvariable=self.sep_model_label,
+            values=list(SEP_MODELS.keys()),
+            state="readonly",
+        ).grid(row=2, column=1, columnspan=3, sticky="ew", pady=4)
+
+        ttk.Label(f, text="Format").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Combobox(
+            f,
+            textvariable=self.sep_format,
+            values=["FLAC", "WAV", "MP3"],
+            width=10,
+            state="readonly",
+        ).grid(row=3, column=1, sticky="w", pady=4)
+        ttk.Label(f, text="Segment").grid(row=3, column=2, sticky="w", padx=(16, 8), pady=4)
+        ttk.Combobox(
+            f,
+            textvariable=self.sep_segment,
+            values=["128", "160", "256", "320", "512"],
+            width=10,
+            state="readonly",
+        ).grid(row=3, column=3, sticky="w", pady=4)
+
+        ttk.Checkbutton(
+            f,
+            text="After success, fill Infer+Merge (vocals → input_path, instrumental → bgm_path)",
+            variable=self.sep_fill_infer_merge,
+        ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(8, 4))
+
+        self.sep_start_btn = ttk.Button(f, text="Start Separate", command=self.run_separate)
+        self.sep_start_btn.grid(row=5, column=3, sticky="e", padx=(10, 0), pady=8)
+
+        ttk.Label(
+            parent,
+            text=(
+                "Exports 2 stems: Vocals + Instrumental. Uses local audio-separator venv "
+                "(see Settings). Global Start is disabled on this tab."
+            ),
+            wraplength=900,
+        ).pack(anchor="w", padx=8, pady=6)
+
+    def _browse_sep_input(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Select audio to separate",
+            filetypes=AUDIO_FILETYPES,
+            **self._path_dialog_opts(self.sep_input_path.get(), for_file=True),
+        )
+        if path:
+            self.sep_input_path.set(path)
+
+    def _browse_sep_output(self) -> None:
+        path = filedialog.askdirectory(
+            title="Select separation output folder",
+            **self._path_dialog_opts(self.sep_output_dir.get()),
+        )
+        if path:
+            self.sep_output_dir.set(path)
+
+    def _resolve_separator_exe(self) -> Path | None:
+        venv = Path(self.sep_venv_dir.get().strip() or str(DEFAULT_SEP_VENV)).expanduser()
+        candidates = [
+            venv / "Scripts" / "audio-separator.exe",
+            venv / "Scripts" / "audio-separator",
+            venv / "bin" / "audio-separator",
+        ]
+        for c in candidates:
+            if c.is_file():
+                return c
+        return None
+
+    def run_separate(self) -> None:
+        inp = self.sep_input_path.get().strip()
+        out = self.sep_output_dir.get().strip()
+        if not inp or not Path(inp).is_file():
+            messagebox.showerror("Missing input", "Select a valid input_path.")
+            return
+        if not out:
+            messagebox.showerror("Missing output", "Select a valid output_dir.")
+            return
+        exe = self._resolve_separator_exe()
+        if exe is None:
+            messagebox.showerror(
+                "Separator missing",
+                "audio-separator not found in separator venv.\n"
+                f"Current venv: {self.sep_venv_dir.get().strip() or DEFAULT_SEP_VENV}\n"
+                "Run setup_separator.ps1 or point Settings → Separator venv.",
+            )
+            return
+        model_dir = Path(self.sep_model_dir.get().strip() or str(DEFAULT_SEP_MODEL_DIR))
+        model_label = self.sep_model_label.get().strip()
+        model_file = SEP_MODELS.get(model_label)
+        if not model_file:
+            messagebox.showerror("Model", f"Unknown model label: {model_label}")
+            return
+        model_path = model_dir / model_file
+        if not model_path.is_file():
+            messagebox.showerror(
+                "Model missing",
+                f"Model file not found:\n{model_path}\n"
+                "Put checkpoints in the model dir (see Settings).",
+            )
+            return
+
+        Path(out).mkdir(parents=True, exist_ok=True)
+        model_dir.mkdir(parents=True, exist_ok=True)
+
+        cmd = [
+            str(exe),
+            inp,
+            "-m",
+            model_file,
+            "--model_file_dir",
+            str(model_dir),
+            "--output_dir",
+            out,
+            "--output_format",
+            self.sep_format.get().strip() or "FLAC",
+            "--mdxc_segment_size",
+            self.sep_segment.get().strip() or "256",
+            "--log_level",
+            "info",
+        ]
+
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        scripts = exe.parent
+        env["PATH"] = str(scripts) + os.pathsep + env.get("PATH", "")
+        proxy = self.sep_proxy.get().strip()
+        if proxy:
+            for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+                env[key] = proxy
+
+        def on_success() -> None:
+            if self.sep_fill_infer_merge.get():
+                self._maybe_fill_infer_merge_from_sep(out)
+            messagebox.showinfo("Separate done", f"Outputs in:\n{out}")
+
+        self._run_cmd(
+            cmd,
+            rvc_root=PACKAGE_DIR,
+            cwd=PACKAGE_DIR,
+            env=env,
+            on_success=on_success,
+        )
+
+    def _maybe_fill_infer_merge_from_sep(self, out_dir: str) -> None:
+        """Pick newest Vocals / Instrumental (or Other) stems in out_dir."""
+        root = Path(out_dir)
+        if not root.is_dir():
+            return
+        files = [p for p in root.iterdir() if p.is_file()]
+        if not files:
+            return
+
+        def newest(preds: list[Callable[[str], bool]]) -> Path | None:
+            hits = [p for p in files if any(pred(p.name.lower()) for pred in preds)]
+            if not hits:
+                return None
+            return max(hits, key=lambda p: p.stat().st_mtime)
+
+        vocals = newest([lambda n: "(vocals)" in n])
+        instru = newest(
+            [
+                lambda n: "(instrumental)" in n,
+                lambda n: "(other)" in n,
+            ]
+        )
+        if vocals is not None:
+            self.im_input_path.set(str(vocals.resolve()))
+            self.log_queue.put(f"[separate] filled Infer+Merge input_path: {vocals}\n")
+        if instru is not None:
+            self.im_bgm_path.set(str(instru.resolve()))
+            self.log_queue.put(f"[separate] filled Infer+Merge bgm_path: {instru}\n")
+        self._refresh_im_auto_paths()
+
+    # ---- Tab 9: Infer + Merge ----
 
     def _build_tab_infer_merge(self, parent: ttk.Frame) -> None:
         infer = ttk.LabelFrame(parent, text="Long infer", padding=10)
@@ -1670,10 +2100,9 @@ class App:
 
         self._row_path(merge, 0, "infer_result", self.im_infer_result, self._browse_im_infer_result)
         self._row_path(merge, 1, "bgm_path", self.im_bgm_path, self._browse_im_bgm)
-        im_merge_entry, im_merge_btn = self._row_path(
+        self._row_path(
             merge, 2, "merge_output_dir", self.im_merge_output_dir, self._browse_im_merge_out_dir
         )
-        self._register_exp_lock_widgets(im_merge_entry, im_merge_btn)
         self._row_readonly(merge, 3, "merge_output_path", self.im_merge_output_path)
 
         self.im_merge_btn = ttk.Button(merge, text="Start Merge", command=self.run_merge)
@@ -1779,8 +2208,6 @@ class App:
             self.im_bgm_path.set(path)
 
     def _browse_im_merge_out_dir(self) -> None:
-        if self.exp_locked:
-            return
         path = filedialog.askdirectory(
             title="Select merge output folder",
             **self._path_dialog_opts(self.im_merge_output_dir.get()),
@@ -1808,9 +2235,8 @@ class App:
     def _refresh_im_merge_output_path(self) -> None:
         src = self.im_infer_result.get().strip() or self.im_opt_path.get().strip()
         out_dir = self.im_merge_output_dir.get().strip()
-        if not out_dir:
-            out_dir = self._rvc_path("logs", "my_exp", "merged")
         if not src or not out_dir:
+            self.im_merge_output_path.set("")
             return
         src_name = Path(src).name
         if "(Vocals)" in src_name:
@@ -1909,10 +2335,12 @@ class App:
         self.running = running
         self.start_btn.config(state="disabled" if running else "normal")
         self.stop_btn.config(state="normal" if running else "disabled")
+        st = "disabled" if running else "normal"
         if hasattr(self, "im_infer_btn"):
-            st = "disabled" if running else "normal"
             self.im_infer_btn.config(state=st)
             self.im_merge_btn.config(state=st)
+        if hasattr(self, "sep_start_btn"):
+            self.sep_start_btn.config(state=st)
         if running:
             self._set_window_progress(0.0)
             self.status_var.set("Running… 0%")
@@ -1924,6 +2352,15 @@ class App:
 
     def _on_tab_changed(self, _event: tk.Event | None = None) -> None:
         self._update_global_start_state()
+        try:
+            idx = self.notebook.index(self.notebook.select())
+        except tk.TclError:
+            idx = -1
+        if idx == TAB_METRICS:
+            if not self.metrics_exp.get().strip():
+                self._metrics_use_active_exp()
+            else:
+                self._refresh_train_metrics()
         self._save_settings()
 
     def _update_global_start_state(self) -> None:
@@ -1933,8 +2370,8 @@ class App:
             idx = self.notebook.index(self.notebook.select())
         except tk.TclError:
             return
-        # Global Start disabled on Settings and Infer+Merge (tab-local buttons)
-        if idx in (TAB_SETTINGS, TAB_INFER_MERGE):
+        # Global Start disabled on Settings, Metrics, Separate, Infer+Merge
+        if idx in (TAB_SETTINGS, TAB_METRICS, TAB_SEPARATE, TAB_INFER_MERGE):
             self.start_btn.config(state="disabled")
         else:
             self.start_btn.config(state="normal")
@@ -1979,15 +2416,25 @@ class App:
         on_success: Callable[[], None] | None = None,
         env_extra: dict[str, str] | None = None,
         total_epoch: int | None = None,
+        cwd: Path | None = None,
+        env: dict[str, str] | None = None,
     ) -> None:
         if self.running:
             messagebox.showwarning("Busy", "Wait for the current job to finish, or Stop it.")
             return
 
-        env = prepare_rvc_process_env(rvc_root)
-        env["PYTHONUNBUFFERED"] = "1"
-        if env_extra:
-            env.update(env_extra)
+        if env is None:
+            env = prepare_rvc_process_env(rvc_root)
+            env["PYTHONUNBUFFERED"] = "1"
+            if env_extra:
+                env.update(env_extra)
+        else:
+            env = dict(env)
+            env.setdefault("PYTHONUNBUFFERED", "1")
+            if env_extra:
+                env.update(env_extra)
+
+        work_cwd = cwd if cwd is not None else rvc_root
 
         def worker() -> None:
             self.log_queue.put("\n" + "=" * 72 + "\n")
@@ -1996,12 +2443,12 @@ class App:
                 + " ".join(f'"{c}"' if " " in c else c for c in cmd)
                 + "\n"
             )
-            self.log_queue.put(f"cwd: {rvc_root}\n")
+            self.log_queue.put(f"cwd: {work_cwd}\n")
             self.log_queue.put("=" * 72 + "\n")
             try:
                 proc = subprocess.Popen(
                     cmd,
-                    cwd=str(rvc_root),
+                    cwd=str(work_cwd),
                     env=env,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
@@ -2038,6 +2485,12 @@ class App:
         idx = self.notebook.index(self.notebook.select())
         if idx == TAB_SETTINGS:
             messagebox.showinfo("Settings", "Configure RVC root here; use other tabs to run jobs.")
+            return
+        if idx == TAB_METRICS:
+            self._refresh_train_metrics()
+            return
+        if idx == TAB_SEPARATE:
+            messagebox.showinfo("Separate", "Use Start Separate on this tab.")
             return
         if idx == TAB_INFER_MERGE:
             messagebox.showinfo(
@@ -2362,6 +2815,9 @@ class App:
             return
         if not bgm_path or not Path(bgm_path).is_file():
             messagebox.showerror("Missing BGM", "Select a valid background audio file.")
+            return
+        if not self.im_merge_output_dir.get().strip():
+            messagebox.showerror("Missing output", "Select a valid merge_output_dir.")
             return
         if not merge_out:
             messagebox.showerror("Missing output", "merge_output_path is empty.")

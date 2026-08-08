@@ -8,6 +8,10 @@ __pycache__/
 .venv/
 venv/
 
+# Separator checkpoints (large)
+models/*.ckpt
+models/download_checks.json
+
 # OS / editor
 .DS_Store
 Thumbs.db
