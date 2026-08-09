@@ -45,6 +45,7 @@ PARSER_DEFAULTS = {
     "resample_sr": 0,
     "rms_mix_rate": 0.25,
     "protect": 0.33,
+    "breath_mix_rate": 0.65,
     "chunk_sec": 120.0,
     "overlap_sec": 0.30,
     "spk_id": 0,
@@ -65,6 +66,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--resample_sr", type=int, default=PARSER_DEFAULTS["resample_sr"])
     p.add_argument("--rms_mix_rate", type=float, default=PARSER_DEFAULTS["rms_mix_rate"])
     p.add_argument("--protect", type=float, default=PARSER_DEFAULTS["protect"])
+    p.add_argument(
+        "--breath_mix_rate",
+        type=float,
+        default=PARSER_DEFAULTS["breath_mix_rate"],
+        help="Mix highpassed source breath into unvoiced frames (0=off)",
+    )
     p.add_argument("--spk_id", type=int, default=PARSER_DEFAULTS["spk_id"])
     p.add_argument("--chunk_sec", type=float, default=PARSER_DEFAULTS["chunk_sec"])
     p.add_argument("--overlap_sec", type=float, default=PARSER_DEFAULTS["overlap_sec"])
@@ -98,6 +105,55 @@ def apply_preset(args: argparse.Namespace, preset: dict) -> argparse.Namespace:
     if not args.index_path and "index_path" in preset:
         args.index_path = preset["index_path"]
     return args
+
+
+def _vc_single(
+    vc,
+    sid,
+    input_audio_path,
+    f0_up_key,
+    f0_method,
+    file_index,
+    index_rate,
+    resample_sr,
+    rms_mix_rate,
+    protect,
+    breath_mix_rate: float = 0.0,
+):
+    """Call VC.vc_single; pass breath_mix_rate only when the install supports it."""
+    import inspect
+
+    params = inspect.signature(vc.vc_single).parameters
+    if "breath_mix_rate" in params:
+        return vc.vc_single(
+            sid,
+            input_audio_path,
+            f0_up_key,
+            f0_method,
+            file_index,
+            index_rate,
+            resample_sr,
+            rms_mix_rate,
+            protect,
+            breath_mix_rate,
+        )
+    if breath_mix_rate:
+        print(
+            "[warn] RVC install has no breath_mix_rate; ignoring "
+            f"(value={breath_mix_rate})",
+            flush=True,
+        )
+    return vc.vc_single(
+        sid,
+        input_audio_path,
+        f0_up_key,
+        f0_method,
+        file_index,
+        index_rate,
+        resample_sr,
+        rms_mix_rate,
+        protect,
+    )
 
 
 def ffprobe_duration_sec(input_path: str) -> float:
@@ -228,7 +284,8 @@ def main(argv: list[str] | None = None) -> int:
                 f"[chunk {idx:04d}] start={start:.2f}s dur={this_dur:.2f}s",
                 flush=True,
             )
-            info, wav_opt = vc.vc_single(
+            info, wav_opt = _vc_single(
+                vc,
                 args.spk_id,
                 str(chunk_in),
                 args.f0up_key,
@@ -238,6 +295,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.resample_sr,
                 args.rms_mix_rate,
                 args.protect,
+                args.breath_mix_rate,
             )
             if wav_opt is None or wav_opt[0] is None or wav_opt[1] is None:
                 raise RuntimeError(f"Chunk inference failed at {idx}: {info}")

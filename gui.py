@@ -338,6 +338,7 @@ class App:
         self.ab_f0_method = tk.StringVar(value="rmvpe")
         self.ab_index_rate = tk.StringVar(value="0.75")
         self.ab_protect = tk.StringVar(value="0.33")
+        self.ab_breath_mix = tk.StringVar(value="0.65")
         self.ab_rms = tk.StringVar(value="0.25")
         self.ab_resample = tk.StringVar(value="0")
         self.ab_spk = tk.StringVar(value="0")
@@ -359,6 +360,7 @@ class App:
         self.im_resample_sr = tk.StringVar(value="0")
         self.im_rms_mix_rate = tk.StringVar(value="0.95")
         self.im_protect = tk.StringVar(value="0.4")
+        self.im_breath_mix_rate = tk.StringVar(value="0.65")
         self.im_chunk_sec = tk.StringVar(value="200")
         self.im_overlap_sec = tk.StringVar(value="0.3")
         self.im_spk_id = tk.StringVar(value="0")
@@ -636,6 +638,7 @@ class App:
             "ab_f0_method": self.ab_f0_method.get(),
             "ab_index_rate": self.ab_index_rate.get(),
             "ab_protect": self.ab_protect.get(),
+            "ab_breath_mix": self.ab_breath_mix.get(),
             "ab_rms": self.ab_rms.get(),
             "ab_resample": self.ab_resample.get(),
             "ab_spk": self.ab_spk.get(),
@@ -652,6 +655,7 @@ class App:
             "im_resample_sr": self.im_resample_sr.get(),
             "im_rms_mix_rate": self.im_rms_mix_rate.get(),
             "im_protect": self.im_protect.get(),
+            "im_breath_mix_rate": self.im_breath_mix_rate.get(),
             "im_chunk_sec": self.im_chunk_sec.get(),
             "im_overlap_sec": self.im_overlap_sec.get(),
             "im_spk_id": self.im_spk_id.get(),
@@ -725,6 +729,7 @@ class App:
             "ab_f0_method": self.ab_f0_method,
             "ab_index_rate": self.ab_index_rate,
             "ab_protect": self.ab_protect,
+            "ab_breath_mix": self.ab_breath_mix,
             "ab_rms": self.ab_rms,
             "ab_resample": self.ab_resample,
             "ab_spk": self.ab_spk,
@@ -741,6 +746,7 @@ class App:
             "im_resample_sr": self.im_resample_sr,
             "im_rms_mix_rate": self.im_rms_mix_rate,
             "im_protect": self.im_protect,
+            "im_breath_mix_rate": self.im_breath_mix_rate,
             "im_chunk_sec": self.im_chunk_sec,
             "im_overlap_sec": self.im_overlap_sec,
             "im_spk_id": self.im_spk_id,
@@ -866,6 +872,7 @@ class App:
             self.ab_f0_method,
             self.ab_index_rate,
             self.ab_protect,
+            self.ab_breath_mix,
             self.ab_rms,
             self.ab_resample,
             self.ab_spk,
@@ -882,6 +889,7 @@ class App:
             self.im_resample_sr,
             self.im_rms_mix_rate,
             self.im_protect,
+            self.im_breath_mix_rate,
             self.im_chunk_sec,
             self.im_overlap_sec,
             self.im_spk_id,
@@ -1613,11 +1621,19 @@ class App:
 
         ttk.Label(params, text="rms_mix").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=3)
         ttk.Entry(params, textvariable=self.ab_rms, width=8).grid(row=2, column=1, sticky="w", pady=3)
-        ttk.Label(params, text="resample_sr").grid(row=2, column=2, sticky="e", padx=(8, 6), pady=3)
-        ttk.Entry(params, textvariable=self.ab_resample, width=8).grid(row=2, column=3, sticky="w", pady=3)
+        ttk.Label(params, text="breath_mix").grid(row=2, column=2, sticky="e", padx=(8, 6), pady=3)
+        ttk.Entry(params, textvariable=self.ab_breath_mix, width=8).grid(row=2, column=3, sticky="w", pady=3)
 
-        ttk.Label(params, text="spk_id").grid(row=3, column=0, sticky="w", padx=(0, 6), pady=3)
-        ttk.Entry(params, textvariable=self.ab_spk, width=8).grid(row=3, column=1, sticky="w", pady=3)
+        ttk.Label(params, text="resample_sr").grid(row=3, column=0, sticky="w", padx=(0, 6), pady=3)
+        ttk.Entry(params, textvariable=self.ab_resample, width=8).grid(row=3, column=1, sticky="w", pady=3)
+        ttk.Label(params, text="spk_id").grid(row=3, column=2, sticky="e", padx=(8, 6), pady=3)
+        ttk.Entry(params, textvariable=self.ab_spk, width=8).grid(row=3, column=3, sticky="w", pady=3)
+
+        ttk.Label(
+            params,
+            text="breath_mix: unvoiced/sigh mix of source breath (0=off). Needs 0718+ patched RVC.",
+            wraplength=880,
+        ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(2, 0))
 
         play = ttk.LabelFrame(parent, text="Playback / results", padding=10)
         play.pack(fill="x", padx=4, pady=4)
@@ -1892,14 +1908,13 @@ class App:
         if path:
             self.sep_output_dir.set(path)
 
-    def _resolve_separator_exe(self) -> Path | None:
+    def _resolve_separator_python(self) -> Path | None:
         venv = Path(self.sep_venv_dir.get().strip() or str(DEFAULT_SEP_VENV)).expanduser()
-        candidates = [
-            venv / "Scripts" / "audio-separator.exe",
-            venv / "Scripts" / "audio-separator",
-            venv / "bin" / "audio-separator",
-        ]
-        for c in candidates:
+        for c in (
+            venv / "Scripts" / "python.exe",
+            venv / "Scripts" / "python",
+            venv / "bin" / "python",
+        ):
             if c.is_file():
                 return c
         return None
@@ -1913,14 +1928,18 @@ class App:
         if not out:
             messagebox.showerror("Missing output", "Select a valid output_dir.")
             return
-        exe = self._resolve_separator_exe()
-        if exe is None:
+        py = self._resolve_separator_python()
+        if py is None:
             messagebox.showerror(
                 "Separator missing",
-                "audio-separator not found in separator venv.\n"
+                "python.exe not found in separator venv.\n"
                 f"Current venv: {self.sep_venv_dir.get().strip() or DEFAULT_SEP_VENV}\n"
                 "Run setup_separator.ps1 or point Settings → Separator venv.",
             )
+            return
+        wrapper = SCRIPTS_DIR / "run_audio_separator.py"
+        if not wrapper.is_file():
+            messagebox.showerror("Missing script", f"Not found:\n{wrapper}")
             return
         model_dir = Path(self.sep_model_dir.get().strip() or str(DEFAULT_SEP_MODEL_DIR))
         model_label = self.sep_model_label.get().strip()
@@ -1940,8 +1959,12 @@ class App:
         Path(out).mkdir(parents=True, exist_ok=True)
         model_dir.mkdir(parents=True, exist_ok=True)
 
+        # Do not call audio-separator.exe: moving a venv leaves broken absolute paths
+        # inside the console-script launcher (silent exit code 1).
         cmd = [
-            str(exe),
+            str(py),
+            "-u",
+            str(wrapper),
             inp,
             "-m",
             model_file,
@@ -1959,7 +1982,9 @@ class App:
 
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
-        scripts = exe.parent
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+        scripts = py.parent
         env["PATH"] = str(scripts) + os.pathsep + env.get("PATH", "")
         proxy = self.sep_proxy.get().strip()
         if proxy:
@@ -2057,29 +2082,34 @@ class App:
         ttk.Entry(params, textvariable=self.im_rms_mix_rate, width=10).grid(
             row=2, column=1, sticky="w", padx=4
         )
-        ttk.Label(params, text="resample_sr (0=model)").grid(row=2, column=2, sticky="w")
-        ttk.Entry(params, textvariable=self.im_resample_sr, width=10).grid(
+        ttk.Label(params, text="breath_mix_rate").grid(row=2, column=2, sticky="w")
+        ttk.Entry(params, textvariable=self.im_breath_mix_rate, width=10).grid(
             row=2, column=3, sticky="w", padx=4
         )
 
-        ttk.Label(params, text="chunk_sec").grid(row=3, column=0, sticky="w")
-        ttk.Entry(params, textvariable=self.im_chunk_sec, width=10).grid(
+        ttk.Label(params, text="resample_sr (0=model)").grid(row=3, column=0, sticky="w")
+        ttk.Entry(params, textvariable=self.im_resample_sr, width=10).grid(
             row=3, column=1, sticky="w", padx=4
         )
-        ttk.Label(params, text="overlap_sec").grid(row=3, column=2, sticky="w")
-        ttk.Entry(params, textvariable=self.im_overlap_sec, width=10).grid(
+        ttk.Label(params, text="spk_id").grid(row=3, column=2, sticky="w")
+        ttk.Entry(params, textvariable=self.im_spk_id, width=10).grid(
             row=3, column=3, sticky="w", padx=4
         )
 
-        ttk.Label(params, text="spk_id").grid(row=4, column=0, sticky="w")
-        ttk.Entry(params, textvariable=self.im_spk_id, width=10).grid(
+        ttk.Label(params, text="chunk_sec").grid(row=4, column=0, sticky="w")
+        ttk.Entry(params, textvariable=self.im_chunk_sec, width=10).grid(
             row=4, column=1, sticky="w", padx=4
         )
+        ttk.Label(params, text="overlap_sec").grid(row=4, column=2, sticky="w")
+        ttk.Entry(params, textvariable=self.im_overlap_sec, width=10).grid(
+            row=4, column=3, sticky="w", padx=4
+        )
+
         ttk.Label(params, text="filter_radius (harvest only)").grid(
-            row=4, column=2, sticky="w"
+            row=5, column=0, sticky="w"
         )
         ttk.Entry(params, textvariable=self.im_filter_radius, width=10).grid(
-            row=4, column=3, sticky="w", padx=4
+            row=5, column=1, sticky="w", padx=4
         )
 
         self.im_infer_btn = ttk.Button(params, text="Start Infer", command=self.run_infer_long)
@@ -2088,8 +2118,8 @@ class App:
         ttk.Label(
             params,
             text=(
-                "Suggested for speech: index_rate 0.5-0.75, rms_mix_rate 0.25-0.5, "
-                "protect 0.33. filter_radius unused with rmvpe."
+                "Speech tip: protect≈0.33, breath_mix_rate 0.5–0.85 (0=off; needs patched 0718). "
+                "index_rate 0.5–0.75. UV F0 no-interp is on in 0718 pipeline."
             ),
             wraplength=880,
         ).grid(row=6, column=0, columnspan=5, sticky="w", pady=(4, 0))
@@ -2716,6 +2746,8 @@ class App:
             self.ab_index_rate.get().strip() or "0.75",
             "--protect",
             self.ab_protect.get().strip() or "0.33",
+            "--breath_mix_rate",
+            self.ab_breath_mix.get().strip() or "0.65",
             "--rms_mix_rate",
             self.ab_rms.get().strip() or "0.25",
             "--resample_sr",
@@ -2773,6 +2805,8 @@ class App:
             self.im_index_rate.get().strip() or "0.75",
             "--protect",
             self.im_protect.get().strip() or "0.33",
+            "--breath_mix_rate",
+            self.im_breath_mix_rate.get().strip() or "0.65",
             "--rms_mix_rate",
             self.im_rms_mix_rate.get().strip() or "0.25",
             "--resample_sr",

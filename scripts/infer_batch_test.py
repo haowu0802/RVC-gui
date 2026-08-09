@@ -45,6 +45,55 @@ def _safe_stem(name: str) -> str:
     return re.sub(r"[^\w.\-]+", "_", name)
 
 
+def _vc_single(
+    vc,
+    sid,
+    input_audio_path,
+    f0_up_key,
+    f0_method,
+    file_index,
+    index_rate,
+    resample_sr,
+    rms_mix_rate,
+    protect,
+    breath_mix_rate: float = 0.0,
+):
+    """Call VC.vc_single; pass breath_mix_rate only when the install supports it."""
+    import inspect
+
+    params = inspect.signature(vc.vc_single).parameters
+    if "breath_mix_rate" in params:
+        return vc.vc_single(
+            sid,
+            input_audio_path,
+            f0_up_key,
+            f0_method,
+            file_index,
+            index_rate,
+            resample_sr,
+            rms_mix_rate,
+            protect,
+            breath_mix_rate,
+        )
+    if breath_mix_rate:
+        print(
+            "[warn] RVC install has no breath_mix_rate; ignoring "
+            f"(value={breath_mix_rate})",
+            flush=True,
+        )
+    return vc.vc_single(
+        sid,
+        input_audio_path,
+        f0_up_key,
+        f0_method,
+        file_index,
+        index_rate,
+        resample_sr,
+        rms_mix_rate,
+        protect,
+    )
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="RVC multi-weight A/B infer test")
     p.add_argument("--input", required=True, help="Source / test audio path")
@@ -65,6 +114,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--f0_method", default="rmvpe", choices=["rmvpe", "pm", "fcpe"])
     p.add_argument("--index_rate", type=float, default=0.75)
     p.add_argument("--protect", type=float, default=0.33)
+    p.add_argument(
+        "--breath_mix_rate",
+        type=float,
+        default=0.65,
+        help="Mix highpassed source breath into unvoiced frames (0=off)",
+    )
     p.add_argument("--rms_mix_rate", type=float, default=0.25)
     p.add_argument(
         "--resample_sr",
@@ -142,7 +197,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         try:
             vc.get_vc(sid)
-            info, opt = vc.vc_single(
+            info, opt = _vc_single(
+                vc,
                 args.spk_id,
                 str(inp),
                 args.f0_up_key,
@@ -152,6 +208,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.resample_sr,
                 args.rms_mix_rate,
                 args.protect,
+                args.breath_mix_rate,
             )
             sr, audio = opt if opt is not None else (None, None)
             if audio is None or sr is None:
