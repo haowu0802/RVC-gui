@@ -1,11 +1,19 @@
 # Local GUI state (may contain absolute paths)
+rvc_gui.db
+*.db-journal
+*.db-wal
+*.db-shm
+# Legacy flat files (migrated into rvc_gui.db)
 settings.json
+audio_scan_cache.json
+stem_links.json
 
 # Python
 __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+.venv-dfn/
 venv/
 
 # Separator checkpoints (large)

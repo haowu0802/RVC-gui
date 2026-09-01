@@ -1,0 +1,3 @@
+# GUI Python (launch_gui.bat / system python)
+pygame>=2.5
+soundfile>=0.12

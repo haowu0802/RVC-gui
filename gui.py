@@ -20,20 +20,53 @@ _PACKAGE_DIR = Path(__file__).resolve().parent
 if str(_PACKAGE_DIR) not in sys.path:
     sys.path.insert(0, str(_PACKAGE_DIR))
 
+from audio_kind import KIND_FILTER_VALUES
+from playback import (
+    AudioPlayer,
+    PlaybackError,
+    SYSTEM_DEFAULT_DEVICE,
+    device_label_matches,
+    format_time_ms,
+    list_output_devices,
+    pick_default_device_label,
+)
+from convert_match import (
+    build_convert_count_map,
+    find_convert_results_for_source,
+    find_source_for_vocals,
+)
+from source_match import find_separated_for_source
+from app_db import DB_PATH, connect, load_settings_map, save_settings_map
+from stem_links import (
+    add_convert_result,
+    get_source_note,
+    load_stem_links,
+    save_stem_links,
+    set_source_note,
+    source_key,
+    upsert_stem_link,
+)
+from audio_scan import (
+    AudioFileRow,
+    SRC_SORT_LABELS,
+    count_by_kind,
+    filter_rows,
+    format_size,
+    load_scan_cache,
+    save_scan_cache,
+    scan_audio_roots,
+    sort_key_from_label,
+    sort_label,
+    sort_rows,
+)
 from rvc_env import (
     PACKAGE_DIR,
     SCRIPTS_DIR,
-    SETTINGS_PATH,
     find_index_for_model,
     looks_like_rvc_root,
     prepare_rvc_process_env,
     resolve_rvc_root,
     rvc_python,
-)
-from train_metrics import (
-    find_weight_files,
-    merge_metrics_with_weights,
-    parse_train_log,
 )
 
 AUDIO_FILETYPES = [
@@ -44,28 +77,31 @@ JSON_FILETYPES = [("JSON Files", "*.json"), ("All Files", "*.*")]
 PTH_FILETYPES = [("PTH Files", "*.pth"), ("All Files", "*.*")]
 
 TAB_SETTINGS = 0
-TAB_PREPROCESS = 1
-TAB_EXTRACT_F0 = 2
-TAB_EXTRACT_HUBERT = 3
-TAB_TRAIN = 4
-TAB_METRICS = 5
-TAB_BUILD_INDEX = 6
-TAB_INFER_AB = 7
-TAB_SEPARATE = 8
-TAB_INFER_MERGE = 9
+TAB_AUDIO_SCAN = 1
+TAB_SOURCE = 2
+TAB_PROCESS = 3
+TAB_SEPARATE = 4
+TAB_CONVERT = 5
 
 TAB_NAMES = [
     "Settings",
-    "Preprocess",
-    "Extract F0",
-    "Extract HuBERT",
-    "Train",
-    "Train Metrics",
-    "Build Index",
-    "Infer A/B",
+    "Audio Scan",
+    "Source Audio",
+    "Process",
     "Separate",
-    "Infer + Merge",
+    "Convert",
 ]
+
+SRC_TREE_COLUMNS = ("root", "rel", "name", "size", "note", "converted", "path")
+SRC_TREE_COL_DEFAULTS: dict[str, int] = {
+    "root": 100,
+    "rel": 220,
+    "name": 160,
+    "size": 70,
+    "note": 180,
+    "converted": 56,
+    "path": 360,
+}
 
 SEP_MODELS = {
     "MelBand-RoFormer (recommended)": "vocals_mel_band_roformer.ckpt",
@@ -84,9 +120,11 @@ _RE_PROGRESS_FRAC = re.compile(
     r"|Write progress:\s*(\d+)\s*/\s*(\d+)"
     r"|写入进度[：:]\s*(\d+)\s*/\s*(\d+)"
     r"|\[Infer\]\s*\((\d+)\s*/\s*(\d+)\)"
+    r"|\b(\d+)\s*/\s*(\d+)\s*\["  # tqdm: 192/200 [03:00<...
     r")",
     re.IGNORECASE,
 )
+_RE_TQDM_PCT = re.compile(r"(?:^|\s)(\d+)%\|")
 _RE_TRAIN_EPOCH_PCT = re.compile(
     r"(?:训练轮次|Train(?:ing)?\s*epoch)[：:\s]+(\d+)\s*\[(\d+(?:\.\d+)?)%\]",
     re.IGNORECASE,
@@ -196,7 +234,107 @@ def _apply_theme(root: tk.Tk, light: bool) -> dict[str, str]:
         arrowcolor=colors["fg"],
     )
     style.configure("TSeparator", background=colors["border"])
+    # Treeview: clam defaults to light field colors; force theme-aware contrast.
+    style.configure(
+        "Treeview",
+        background=colors["field"],
+        foreground=colors["fg"],
+        fieldbackground=colors["field"],
+        bordercolor=colors["border"],
+        lightcolor=colors["border"],
+        darkcolor=colors["border"],
+        rowheight=24,
+    )
+    style.configure(
+        "Treeview.Heading",
+        background=colors["button"],
+        foreground=colors["fg"],
+        relief="flat",
+        bordercolor=colors["border"],
+    )
+    style.map(
+        "Treeview",
+        background=[("selected", colors["select"])],
+        foreground=[("selected", colors["select_fg"])],
+    )
+    style.map(
+        "Treeview.Heading",
+        background=[("active", colors["select"])],
+        foreground=[("active", colors["select_fg"])],
+    )
+    # Tk Treeview ignores custom colors unless '!disabled' map entries are stripped.
+    def _tree_map(option: str):
+        return [
+            elm
+            for elm in style.map("Treeview", query_opt=option)
+            if elm[:2] != ("!disabled", "!selected")
+        ]
+
+    try:
+        style.map(
+            "Treeview",
+            foreground=_tree_map("foreground"),
+            background=_tree_map("background"),
+        )
+    except tk.TclError:
+        pass
+    try:
+        root.option_add("*Treeview*background", colors["field"])
+        root.option_add("*Treeview*foreground", colors["fg"])
+        root.option_add("*Treeview*fieldBackground", colors["field"])
+    except tk.TclError:
+        pass
+    _configure_action_button_styles(style, light)
     return colors
+
+
+BTN_STYLE_PROCESS = "Process.TButton"
+BTN_STYLE_SEPARATE = "Separate.TButton"
+BTN_STYLE_CONVERT = "Convert.TButton"
+
+
+def _action_button_font() -> tuple[str, int, str]:
+    if sys.platform == "win32":
+        return ("Segoe UI", 10, "bold")
+    return ("TkDefaultFont", 10, "bold")
+
+
+def _configure_action_button_styles(style: ttk.Style, light: bool) -> None:
+    font = _action_button_font()
+    pad = [18, 8]
+    if light:
+        specs = {
+            BTN_STYLE_PROCESS: ("#2563eb", "#ffffff", "#1d4ed8", "#93c5fd"),
+            BTN_STYLE_SEPARATE: ("#ea580c", "#ffffff", "#c2410c", "#fdba74"),
+            BTN_STYLE_CONVERT: ("#059669", "#ffffff", "#047857", "#6ee7b7"),
+        }
+        disabled_bg = "#c8c8c8"
+        disabled_fg = "#888888"
+    else:
+        specs = {
+            BTN_STYLE_PROCESS: ("#3b82f6", "#ffffff", "#2563eb", "#60a5fa"),
+            BTN_STYLE_SEPARATE: ("#f97316", "#ffffff", "#ea580c", "#fb923c"),
+            BTN_STYLE_CONVERT: ("#10b981", "#ffffff", "#059669", "#34d399"),
+        }
+        disabled_bg = "#4a4a4a"
+        disabled_fg = "#9a9a9a"
+
+    for name, (bg, fg, active_bg, active_fg) in specs.items():
+        style.configure(
+            name,
+            font=font,
+            padding=pad,
+            background=bg,
+            foreground=fg,
+            borderwidth=1,
+            focusthickness=2,
+            focuscolor=active_bg,
+        )
+        style.map(
+            name,
+            background=[("disabled", disabled_bg), ("active", active_bg), ("pressed", active_bg)],
+            foreground=[("disabled", disabled_fg), ("active", active_fg), ("pressed", active_fg)],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -261,8 +399,13 @@ class App:
         self.proc: subprocess.Popen[str] | None = None
         self.running = False
         self._persist_trace_ids: list[str] = []
-        self._suppress_autosave = False
-        self._playback = None  # sounddevice stream / data handle
+        self._suppress_autosave = True
+        self._settings_hydrated = False
+        self._geometry_save_after_id: str | None = None
+        self._player = AudioPlayer()
+        self._playback_after_id: str | None = None
+        self._pb_ignore_seek = False
+        self._pb_seeking = False
         self._job_pct: float | None = None
         self._job_total_epoch: int | None = None
         self._job_audio_duration: float | None = None
@@ -274,77 +417,42 @@ class App:
         self.rvc_root = tk.StringVar(value="")
         self.active_exp_path = tk.StringVar(value="")
         self.python_path_display = tk.StringVar(value="(set RVC root first)")
+        self.favorite_experiments: list[str] = []
+        self.favorite_models: list[str] = []
+        self.fav_exp_pick = tk.StringVar(value="")
+        self.fav_model_pick = tk.StringVar(value="")
+        self.fav_exp_btn_label = tk.StringVar(value="★ Fav")
+        self.fav_model_btn_label = tk.StringVar(value="★ Fav")
         self.status_var = tk.StringVar(value="Idle")
         self.last_tab = tk.IntVar(value=0)
         self.geometry_var = tk.StringVar(value="1080x780")
 
-        # --- preprocess ---
-        self.pp_inp_root = tk.StringVar(value="")
-        self.pp_exp_dir = tk.StringVar(value="logs/my_exp")
-        self.pp_sr = tk.StringVar(value="48000")
-        self.pp_n_p = tk.StringVar(value="8")
-        self.pp_per = tk.StringVar(value="3.5")
-        self.pp_overlap = tk.StringVar(value="0.3")
-        self.pp_noparallel = tk.BooleanVar(value=False)
-        self.pp_highpass = tk.BooleanVar(value=True)
-        self.pp_highpass_hz = tk.StringVar(value="48.0")
-        self.pp_threshold = tk.StringVar(value="-42")
-        self.pp_min_length = tk.StringVar(value="1500")
-        self.pp_min_interval = tk.StringVar(value="400")
-        self.pp_hop_size = tk.StringVar(value="15")
-        self.pp_max_sil_kept = tk.StringVar(value="500")
-        self.pp_norm_max = tk.StringVar(value="0.9")
-        self.pp_norm_alpha = tk.StringVar(value="0.75")
-        self.pp_peak_reject = tk.StringVar(value="2.5")
+        # --- global playback ---
+        self.pb_device = tk.StringVar(value="")
+        self.pb_volume = tk.DoubleVar(value=80.0)
 
-        # --- extract f0 / hubert ---
-        self.f0_exp = tk.StringVar(value="my_exp")
-        self.f0_gpu = tk.StringVar(value="0")
-        self.f0_is_half = tk.BooleanVar(value=True)
-        self.hb_exp = tk.StringVar(value="my_exp")
-        self.hb_gpu = tk.StringVar(value="0")
-        self.hb_version = tk.StringVar(value="v2")
-        self.hb_is_half = tk.BooleanVar(value=True)
-
-        # --- train ---
-        self.tr_exp = tk.StringVar(value="my_exp")
-        self.tr_sample_rate = tk.StringVar(value="48k")
-        self.tr_version = tk.StringVar(value="v2")
-        self.tr_if_f0 = tk.BooleanVar(value=True)
-        self.tr_spk_id = tk.StringVar(value="0")
-        self.tr_batch_size = tk.StringVar(value="6")
-        self.tr_total_epoch = tk.StringVar(value="200")
-        self.tr_save_every_epoch = tk.StringVar(value="5")
-        self.tr_gpus = tk.StringVar(value="0")
-        self.tr_pretrain_g = tk.StringVar(value="")
-        self.tr_pretrain_d = tk.StringVar(value="")
-        self.tr_save_latest_only = tk.BooleanVar(value=True)
-        self.tr_cache_in_gpu = tk.BooleanVar(value=False)
-        self.tr_save_every_weights = tk.BooleanVar(value=True)
-
-        # --- build index ---
-        self.ix_exp = tk.StringVar(value="my_exp")
-        self.ix_version = tk.StringVar(value="v2")
-        self.ix_outside = tk.StringVar(value="")
-        self.ix_n_cpu = tk.StringVar(value="4")
-
-        # --- infer A/B ---
-        self.ab_input = tk.StringVar(value="")
-        self.ab_weights_dir = tk.StringVar(value="")
-        self.ab_filter = tk.StringVar(value="")
-        self.ab_index = tk.StringVar(value="")
-        self.ab_out_dir = tk.StringVar(value="")
-        self.ab_pitch = tk.StringVar(value="0")
-        self.ab_f0_method = tk.StringVar(value="rmvpe")
-        self.ab_index_rate = tk.StringVar(value="0.75")
-        self.ab_protect = tk.StringVar(value="0.33")
-        self.ab_breath_mix = tk.StringVar(value="0.65")
-        self.ab_rms = tk.StringVar(value="0.25")
-        self.ab_resample = tk.StringVar(value="0")
-        self.ab_spk = tk.StringVar(value="0")
-        self.ab_device = tk.StringVar(value="")
-        self._weight_vars: dict[str, tk.BooleanVar] = {}
-        self._result_paths: list[str] = []
+        # --- audio scan ---
+        self.as_filter = tk.StringVar(value="")
+        self.as_kind_filter = tk.StringVar(value="all")
+        self.src_filter = tk.StringVar(value="")
+        self.src_sort_label = tk.StringVar(value=sort_label("rel_path"))
+        self.src_sort_desc = tk.BooleanVar(value=False)
+        self.audio_scan_roots: list[str] = []
+        self._audio_scan_rows: list[AudioFileRow] = []
+        self._audio_scan_running = False
+        self._process_source_path: str | None = None
+        self._convert_source_path: str | None = None
+        self._src_note_editor: tk.Entry | None = None
+        self._src_note_edit_item: str | None = None
+        self._src_note_edit_path: str | None = None
+        self._src_note_committing = False
+        self._src_tree_col_widths: dict[str, int] = {}
+        self._db = connect()
+        self._stem_links = load_stem_links(self._db)
+        self._audio_scan_revision = 0
+        self._stem_links_revision = 0
+        self._src_display_cache_key: tuple[object, ...] | None = None
+        self._src_display_cache_payload: list[tuple[AudioFileRow, str, int]] | None = None
 
         # --- infer + merge ---
         self.im_model_path = tk.StringVar(value="")
@@ -385,12 +493,42 @@ class App:
         self._wire_autosave()
         self._refresh_python_display()
         self._fill_empty_defaults_from_root()
-        self._refresh_ab_devices()
 
+        self.root.bind("<Configure>", self._on_root_configure, add="+")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(80, self._drain_log_queue)
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
         self._update_global_start_state()
+
+    def _invalidate_source_display_cache(self) -> None:
+        self._src_display_cache_key = None
+        self._src_display_cache_payload = None
+
+    def _persist_stem_links(self) -> None:
+        save_stem_links(self._stem_links, self._db)
+        self._stem_links_revision += 1
+        self._invalidate_source_display_cache()
+
+    def _source_display_cache_key(self) -> tuple[object, ...]:
+        return (
+            self.src_filter.get().strip().lower(),
+            self._audio_scan_revision,
+            self._stem_links_revision,
+            len(self._audio_scan_rows),
+        )
+
+    def _build_source_display_payload(
+        self, rows: list[AudioFileRow]
+    ) -> list[tuple[AudioFileRow, str, int]]:
+        paths = [r.path for r in rows]
+        count_map = build_convert_count_map(paths, self._stem_links, self._audio_scan_rows)
+        payload: list[tuple[AudioFileRow, str, int]] = []
+        for r in rows:
+            note = get_source_note(r.path, self._stem_links)
+            key = str(Path(r.path).resolve())
+            cvt_n = count_map.get(key, 0)
+            payload.append((r, note, cvt_n))
+        return payload
 
     # ------------------------------------------------------------------
     # Path helpers
@@ -462,14 +600,8 @@ class App:
                 root = resolve_rvc_root(self.rvc_root.get().strip() or None)
             except FileNotFoundError:
                 return
-        if not self.ab_weights_dir.get().strip():
-            self.ab_weights_dir.set(str(root / "assets" / "weights"))
-        if not self.ix_outside.get().strip():
-            self.ix_outside.set(str(root / "assets" / "indices"))
         if self.exp_locked:
             return
-        if not self.ab_out_dir.get().strip():
-            self.ab_out_dir.set(str(root / "logs" / "my_exp" / "infer_ab_test"))
         if not self.im_infer_output_dir.get().strip():
             self.im_infer_output_dir.set(str(root / "logs" / "my_exp" / "infer_long"))
 
@@ -538,20 +670,13 @@ class App:
         self._suppress_autosave = True
         try:
             self.active_exp_path.set(str(p))
-            self.pp_exp_dir.set(str(p))
-            self.f0_exp.set(name)
-            self.hb_exp.set(name)
-            self.tr_exp.set(name)
-            self.ix_exp.set(name)
-            if hasattr(self, "metrics_exp"):
-                self.metrics_exp.set(name)
-            self.ab_out_dir.set(str(p / "infer_ab_test"))
             self.im_infer_output_dir.set(str(p / "infer_long"))
             self._refresh_im_auto_paths()
             self.exp_locked = bool(lock)
             self._set_exp_widgets_locked(self.exp_locked)
         finally:
             self._suppress_autosave = was
+        self._refresh_fav_exp_combo()
         self._save_settings()
         return True
 
@@ -561,9 +686,11 @@ class App:
         try:
             self.exp_locked = False
             self.active_exp_path.set("")
+            self.fav_exp_pick.set("")
             self._set_exp_widgets_locked(False)
         finally:
             self._suppress_autosave = was
+        self._update_fav_exp_btn_label()
         self._save_settings()
 
     def _browse_active_exp(self) -> None:
@@ -576,73 +703,215 @@ class App:
         if path:
             self._apply_active_experiment(path, lock=True)
 
+    @staticmethod
+    def _normalize_path_list(items: Any) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        if not isinstance(items, list):
+            return out
+        for item in items:
+            if not isinstance(item, str):
+                continue
+            p = item.strip().strip('"')
+            if not p:
+                continue
+            try:
+                key = str(Path(p).resolve())
+            except Exception:
+                key = p
+            if key.lower() in seen:
+                continue
+            seen.add(key.lower())
+            out.append(key)
+        return out
+
+    @staticmethod
+    def _fav_display_label(path: str, *, is_dir: bool) -> str:
+        p = Path(path)
+        name = p.name or path
+        # Include path so duplicates stay unique in the Combobox.
+        return f"{name}  —  {path}"
+
+    def _refresh_fav_exp_combo(self) -> None:
+        labels = [
+            self._fav_display_label(p, is_dir=True) for p in self.favorite_experiments
+        ]
+        if hasattr(self, "fav_exp_combo"):
+            self.fav_exp_combo["values"] = labels
+        cur = self.active_exp_path.get().strip()
+        if cur:
+            try:
+                cur_key = str(Path(cur).resolve())
+            except Exception:
+                cur_key = cur
+            for i, p in enumerate(self.favorite_experiments):
+                if p.lower() == cur_key.lower():
+                    self.fav_exp_pick.set(labels[i])
+                    break
+        self._update_fav_exp_btn_label()
+
+    def _refresh_fav_model_combo(self) -> None:
+        labels = [
+            self._fav_display_label(p, is_dir=False) for p in self.favorite_models
+        ]
+        if hasattr(self, "fav_model_combo"):
+            self.fav_model_combo["values"] = labels
+        cur = self.im_model_path.get().strip()
+        if cur:
+            try:
+                cur_key = str(Path(cur).resolve())
+            except Exception:
+                cur_key = cur
+            for i, p in enumerate(self.favorite_models):
+                if p.lower() == cur_key.lower():
+                    self.fav_model_pick.set(labels[i])
+                    break
+        self._update_fav_model_btn_label()
+
+    def _update_fav_exp_btn_label(self) -> None:
+        path = self.active_exp_path.get().strip()
+        if not path:
+            self.fav_exp_btn_label.set("★ Fav")
+            return
+        try:
+            key = str(Path(path).resolve())
+        except Exception:
+            key = path
+        if any(p.lower() == key.lower() for p in self.favorite_experiments):
+            self.fav_exp_btn_label.set("★ Unfav")
+        else:
+            self.fav_exp_btn_label.set("★ Fav")
+
+    def _update_fav_model_btn_label(self) -> None:
+        path = self.im_model_path.get().strip()
+        if not path:
+            self.fav_model_btn_label.set("★ Fav")
+            return
+        try:
+            key = str(Path(path).resolve())
+        except Exception:
+            key = path
+        if any(p.lower() == key.lower() for p in self.favorite_models):
+            self.fav_model_btn_label.set("★ Unfav")
+        else:
+            self.fav_model_btn_label.set("★ Fav")
+
+    def _toggle_favorite_experiment(self) -> None:
+        path = self.active_exp_path.get().strip()
+        if not path:
+            messagebox.showinfo("Favorites", "Browse or select an experiment first.")
+            return
+        try:
+            key = str(Path(path).resolve())
+        except Exception:
+            key = path
+        existing = [p for p in self.favorite_experiments if p.lower() == key.lower()]
+        if existing:
+            self.favorite_experiments = [
+                p for p in self.favorite_experiments if p.lower() != key.lower()
+            ]
+        else:
+            if not Path(key).is_dir():
+                messagebox.showerror("Favorites", f"Experiment folder not found:\n{key}")
+                return
+            self.favorite_experiments.append(key)
+        self._refresh_fav_exp_combo()
+        self._save_settings()
+
+    def _apply_favorite_experiment(self, _event: Any = None) -> None:
+        label = self.fav_exp_pick.get().strip()
+        if not label:
+            return
+        labels = [
+            self._fav_display_label(p, is_dir=True) for p in self.favorite_experiments
+        ]
+        try:
+            idx = labels.index(label)
+        except ValueError:
+            return
+        path = self.favorite_experiments[idx]
+        if not Path(path).is_dir():
+            messagebox.showerror(
+                "Favorites",
+                f"Favorite experiment missing (removed from list):\n{path}",
+            )
+            self.favorite_experiments = [
+                p for p in self.favorite_experiments if p.lower() != path.lower()
+            ]
+            self._refresh_fav_exp_combo()
+            self._save_settings()
+            return
+        self._apply_active_experiment(path, lock=True)
+
+    def _toggle_favorite_model(self) -> None:
+        path = self.im_model_path.get().strip()
+        if not path:
+            messagebox.showinfo("Favorites", "Browse or select a model .pth first.")
+            return
+        try:
+            key = str(Path(path).resolve())
+        except Exception:
+            key = path
+        if any(p.lower() == key.lower() for p in self.favorite_models):
+            self.favorite_models = [
+                p for p in self.favorite_models if p.lower() != key.lower()
+            ]
+        else:
+            if not Path(key).is_file():
+                messagebox.showerror("Favorites", f"Model file not found:\n{key}")
+                return
+            self.favorite_models.append(key)
+        self._refresh_fav_model_combo()
+        self._save_settings()
+
+    def _apply_favorite_model(self, _event: Any = None) -> None:
+        label = self.fav_model_pick.get().strip()
+        if not label:
+            return
+        labels = [
+            self._fav_display_label(p, is_dir=False) for p in self.favorite_models
+        ]
+        try:
+            idx = labels.index(label)
+        except ValueError:
+            return
+        path = self.favorite_models[idx]
+        if not Path(path).is_file():
+            messagebox.showerror(
+                "Favorites",
+                f"Favorite model file not found:\n{path}",
+            )
+            return
+        self.im_model_path.set(path)
+        self.im_model_name.set(Path(path).name)
+        self._autofill_im_index()
+        self._refresh_im_auto_paths()
+        self._update_fav_model_btn_label()
+
     # ------------------------------------------------------------------
     # Settings persistence
     # ------------------------------------------------------------------
 
     def _persist_map(self) -> dict[str, Any]:
+        self._capture_src_tree_col_widths()
         return {
             "geometry": self.root.geometry(),
             "last_tab": self.notebook.index(self.notebook.select()) if hasattr(self, "notebook") else 0,
             "rvc_root": self.rvc_root.get(),
             "active_exp_path": self.active_exp_path.get(),
             "exp_locked": self.exp_locked,
-            "pp_inp_root": self.pp_inp_root.get(),
-            "pp_exp_dir": self.pp_exp_dir.get(),
-            "pp_sr": self.pp_sr.get(),
-            "pp_n_p": self.pp_n_p.get(),
-            "pp_per": self.pp_per.get(),
-            "pp_overlap": self.pp_overlap.get(),
-            "pp_noparallel": self.pp_noparallel.get(),
-            "pp_highpass": self.pp_highpass.get(),
-            "pp_highpass_hz": self.pp_highpass_hz.get(),
-            "pp_threshold": self.pp_threshold.get(),
-            "pp_min_length": self.pp_min_length.get(),
-            "pp_min_interval": self.pp_min_interval.get(),
-            "pp_hop_size": self.pp_hop_size.get(),
-            "pp_max_sil_kept": self.pp_max_sil_kept.get(),
-            "pp_norm_max": self.pp_norm_max.get(),
-            "pp_norm_alpha": self.pp_norm_alpha.get(),
-            "pp_peak_reject": self.pp_peak_reject.get(),
-            "f0_exp": self.f0_exp.get(),
-            "f0_gpu": self.f0_gpu.get(),
-            "f0_is_half": self.f0_is_half.get(),
-            "hb_exp": self.hb_exp.get(),
-            "hb_gpu": self.hb_gpu.get(),
-            "hb_version": self.hb_version.get(),
-            "hb_is_half": self.hb_is_half.get(),
-            "tr_exp": self.tr_exp.get(),
-            "tr_sample_rate": self.tr_sample_rate.get(),
-            "tr_version": self.tr_version.get(),
-            "tr_if_f0": self.tr_if_f0.get(),
-            "tr_spk_id": self.tr_spk_id.get(),
-            "tr_batch_size": self.tr_batch_size.get(),
-            "tr_total_epoch": self.tr_total_epoch.get(),
-            "tr_save_every_epoch": self.tr_save_every_epoch.get(),
-            "tr_gpus": self.tr_gpus.get(),
-            "tr_pretrain_g": self.tr_pretrain_g.get(),
-            "tr_pretrain_d": self.tr_pretrain_d.get(),
-            "tr_save_latest_only": self.tr_save_latest_only.get(),
-            "tr_cache_in_gpu": self.tr_cache_in_gpu.get(),
-            "tr_save_every_weights": self.tr_save_every_weights.get(),
-            "ix_exp": self.ix_exp.get(),
-            "ix_version": self.ix_version.get(),
-            "ix_outside": self.ix_outside.get(),
-            "ix_n_cpu": self.ix_n_cpu.get(),
-            "ab_input": self.ab_input.get(),
-            "ab_weights_dir": self.ab_weights_dir.get(),
-            "ab_filter": self.ab_filter.get(),
-            "ab_index": self.ab_index.get(),
-            "ab_out_dir": self.ab_out_dir.get(),
-            "ab_pitch": self.ab_pitch.get(),
-            "ab_f0_method": self.ab_f0_method.get(),
-            "ab_index_rate": self.ab_index_rate.get(),
-            "ab_protect": self.ab_protect.get(),
-            "ab_breath_mix": self.ab_breath_mix.get(),
-            "ab_rms": self.ab_rms.get(),
-            "ab_resample": self.ab_resample.get(),
-            "ab_spk": self.ab_spk.get(),
-            "ab_device": self.ab_device.get(),
+            "favorite_experiments": list(self.favorite_experiments),
+            "favorite_models": list(self.favorite_models),
+            "pb_device": self.pb_device.get(),
+            "pb_volume": self.pb_volume.get(),
+            "audio_scan_roots": list(self.audio_scan_roots),
+            "as_filter": self.as_filter.get(),
+            "as_kind_filter": self.as_kind_filter.get(),
+            "src_filter": self.src_filter.get(),
+            "src_sort_by": sort_key_from_label(self.src_sort_label.get()),
+            "src_sort_desc": bool(self.src_sort_desc.get()),
+            "src_tree_col_widths": dict(self._src_tree_col_widths),
+            "convert_source_path": self._convert_source_path or "",
             "im_model_path": self.im_model_path.get(),
             "im_model_name": self.im_model_name.get(),
             "im_index_path": self.im_index_path.get(),
@@ -675,65 +944,15 @@ class App:
 
     def _load_settings(self) -> None:
         self._suppress_autosave = True
-        if SETTINGS_PATH.is_file():
-            try:
-                data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
-            except Exception:
-                data = {}
-        else:
-            data = {}
+        data = load_settings_map(self._db)
 
         str_vars = {
             "rvc_root": self.rvc_root,
             "active_exp_path": self.active_exp_path,
-            "pp_inp_root": self.pp_inp_root,
-            "pp_exp_dir": self.pp_exp_dir,
-            "pp_sr": self.pp_sr,
-            "pp_n_p": self.pp_n_p,
-            "pp_per": self.pp_per,
-            "pp_overlap": self.pp_overlap,
-            "pp_highpass_hz": self.pp_highpass_hz,
-            "pp_threshold": self.pp_threshold,
-            "pp_min_length": self.pp_min_length,
-            "pp_min_interval": self.pp_min_interval,
-            "pp_hop_size": self.pp_hop_size,
-            "pp_max_sil_kept": self.pp_max_sil_kept,
-            "pp_norm_max": self.pp_norm_max,
-            "pp_norm_alpha": self.pp_norm_alpha,
-            "pp_peak_reject": self.pp_peak_reject,
-            "f0_exp": self.f0_exp,
-            "f0_gpu": self.f0_gpu,
-            "hb_exp": self.hb_exp,
-            "hb_gpu": self.hb_gpu,
-            "hb_version": self.hb_version,
-            "tr_exp": self.tr_exp,
-            "tr_sample_rate": self.tr_sample_rate,
-            "tr_version": self.tr_version,
-            "tr_spk_id": self.tr_spk_id,
-            "tr_batch_size": self.tr_batch_size,
-            "tr_total_epoch": self.tr_total_epoch,
-            "tr_save_every_epoch": self.tr_save_every_epoch,
-            "tr_gpus": self.tr_gpus,
-            "tr_pretrain_g": self.tr_pretrain_g,
-            "tr_pretrain_d": self.tr_pretrain_d,
-            "ix_exp": self.ix_exp,
-            "ix_version": self.ix_version,
-            "ix_outside": self.ix_outside,
-            "ix_n_cpu": self.ix_n_cpu,
-            "ab_input": self.ab_input,
-            "ab_weights_dir": self.ab_weights_dir,
-            "ab_filter": self.ab_filter,
-            "ab_index": self.ab_index,
-            "ab_out_dir": self.ab_out_dir,
-            "ab_pitch": self.ab_pitch,
-            "ab_f0_method": self.ab_f0_method,
-            "ab_index_rate": self.ab_index_rate,
-            "ab_protect": self.ab_protect,
-            "ab_breath_mix": self.ab_breath_mix,
-            "ab_rms": self.ab_rms,
-            "ab_resample": self.ab_resample,
-            "ab_spk": self.ab_spk,
-            "ab_device": self.ab_device,
+            "pb_device": self.pb_device,
+            "as_filter": self.as_filter,
+            "as_kind_filter": self.as_kind_filter,
+            "src_filter": self.src_filter,
             "im_model_path": self.im_model_path,
             "im_model_name": self.im_model_name,
             "im_index_path": self.im_index_path,
@@ -763,22 +982,26 @@ class App:
             "sep_proxy": self.sep_proxy,
         }
         bool_vars = {
-            "pp_noparallel": self.pp_noparallel,
-            "pp_highpass": self.pp_highpass,
-            "f0_is_half": self.f0_is_half,
-            "hb_is_half": self.hb_is_half,
-            "tr_if_f0": self.tr_if_f0,
-            "tr_save_latest_only": self.tr_save_latest_only,
-            "tr_cache_in_gpu": self.tr_cache_in_gpu,
-            "tr_save_every_weights": self.tr_save_every_weights,
             "sep_fill_infer_merge": self.sep_fill_infer_merge,
         }
         for key, var in str_vars.items():
             if key in data and data[key] is not None:
                 var.set(str(data[key]))
+        if "pb_volume" in data:
+            try:
+                self.pb_volume.set(float(data["pb_volume"]))
+            except (TypeError, ValueError):
+                pass
+        elif "ab_device" in data and data["ab_device"] and not self.pb_device.get():
+            self.pb_device.set(str(data["ab_device"]))
         for key, var in bool_vars.items():
             if key in data:
                 var.set(bool(data[key]))
+
+        sort_by = str(data.get("src_sort_by", "rel_path"))
+        self.src_sort_label.set(sort_label(sort_by))
+        if "src_sort_desc" in data:
+            self.src_sort_desc.set(bool(data["src_sort_desc"]))
 
         geo = data.get("geometry")
         if isinstance(geo, str) and geo:
@@ -796,6 +1019,12 @@ class App:
         self.root.after(50, lambda: self.notebook.select(last_i))
 
         self._refresh_im_auto_paths()
+        self.favorite_experiments = self._normalize_path_list(
+            data.get("favorite_experiments", [])
+        )
+        self.favorite_models = self._normalize_path_list(data.get("favorite_models", []))
+        self.audio_scan_roots = self._normalize_path_list(data.get("audio_scan_roots", []))
+        self._restore_audio_scan_from_settings()
         want_lock = bool(data.get("exp_locked", False))
         active = self.active_exp_path.get().strip()
         if want_lock and active:
@@ -803,17 +1032,47 @@ class App:
         else:
             self.exp_locked = False
             self._set_exp_widgets_locked(False)
+        self._refresh_fav_exp_combo()
+        self._refresh_fav_model_combo()
+        self._apply_playback_settings()
+        self._src_tree_col_widths = self._parse_src_tree_col_widths(
+            data.get("src_tree_col_widths")
+        )
+        self._apply_src_tree_col_widths()
+        csp = str(data.get("convert_source_path", "")).strip()
+        if csp and Path(csp).is_file():
+            self._convert_source_path = csp
+        elif self._convert_source_path is None:
+            vocals = self.im_input_path.get().strip()
+            if vocals:
+                src = find_source_for_vocals(vocals, self._stem_links, self._audio_scan_rows)
+                if src:
+                    self._convert_source_path = src
+        self.root.after(100, self._refresh_convert_results_list)
+        self._settings_hydrated = True
         self._suppress_autosave = False
 
-    def _save_settings(self) -> None:
+    def _on_root_configure(self, event: tk.Event) -> None:
+        if event.widget is not self.root:
+            return
         if self._suppress_autosave:
             return
+        if self._geometry_save_after_id is not None:
+            try:
+                self.root.after_cancel(self._geometry_save_after_id)
+            except tk.TclError:
+                pass
+        self._geometry_save_after_id = self.root.after(500, self._save_geometry_debounced)
+
+    def _save_geometry_debounced(self) -> None:
+        self._geometry_save_after_id = None
+        self._save_settings()
+
+    def _save_settings(self) -> None:
+        if self._suppress_autosave or not self._settings_hydrated:
+            return
         try:
-            data = self._persist_map()
-            SETTINGS_PATH.write_text(
-                json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
+            save_settings_map(self._db, self._persist_map())
         except Exception:
             pass
 
@@ -821,62 +1080,11 @@ class App:
         vars_to_trace: list[tk.Variable] = [
             self.rvc_root,
             self.active_exp_path,
-            self.pp_inp_root,
-            self.pp_exp_dir,
-            self.pp_sr,
-            self.pp_n_p,
-            self.pp_per,
-            self.pp_overlap,
-            self.pp_noparallel,
-            self.pp_highpass,
-            self.pp_highpass_hz,
-            self.pp_threshold,
-            self.pp_min_length,
-            self.pp_min_interval,
-            self.pp_hop_size,
-            self.pp_max_sil_kept,
-            self.pp_norm_max,
-            self.pp_norm_alpha,
-            self.pp_peak_reject,
-            self.f0_exp,
-            self.f0_gpu,
-            self.f0_is_half,
-            self.hb_exp,
-            self.hb_gpu,
-            self.hb_version,
-            self.hb_is_half,
-            self.tr_exp,
-            self.tr_sample_rate,
-            self.tr_version,
-            self.tr_if_f0,
-            self.tr_spk_id,
-            self.tr_batch_size,
-            self.tr_total_epoch,
-            self.tr_save_every_epoch,
-            self.tr_gpus,
-            self.tr_pretrain_g,
-            self.tr_pretrain_d,
-            self.tr_save_latest_only,
-            self.tr_cache_in_gpu,
-            self.tr_save_every_weights,
-            self.ix_exp,
-            self.ix_version,
-            self.ix_outside,
-            self.ix_n_cpu,
-            self.ab_input,
-            self.ab_weights_dir,
-            self.ab_filter,
-            self.ab_index,
-            self.ab_out_dir,
-            self.ab_pitch,
-            self.ab_f0_method,
-            self.ab_index_rate,
-            self.ab_protect,
-            self.ab_breath_mix,
-            self.ab_rms,
-            self.ab_resample,
-            self.ab_spk,
-            self.ab_device,
+            self.pb_device,
+            self.pb_volume,
+            self.as_filter,
+            self.as_kind_filter,
+            self.src_filter,
             self.im_model_path,
             self.im_model_name,
             self.im_index_path,
@@ -912,9 +1120,13 @@ class App:
 
     def _on_close(self) -> None:
         self._save_settings()
-        self._stop_playback()
+        self._playback_stop()
         if self.running and self.proc is not None:
             self._kill_process()
+        try:
+            self._db.close()
+        except Exception:
+            pass
         self.root.destroy()
 
     # ------------------------------------------------------------------
@@ -931,21 +1143,19 @@ class App:
         self._tab_frames: list[ScrollableFrame] = []
         builders = [
             self._build_tab_settings,
-            self._build_tab_preprocess,
-            self._build_tab_extract_f0,
-            self._build_tab_extract_hubert,
-            self._build_tab_train,
-            self._build_tab_train_metrics,
-            self._build_tab_build_index,
-            self._build_tab_infer_ab,
+            self._build_tab_audio_scan,
+            self._build_tab_source_audio,
+            self._build_tab_process,
             self._build_tab_separate,
-            self._build_tab_infer_merge,
+            self._build_tab_convert,
         ]
         for name, builder in zip(TAB_NAMES, builders):
             sf = ScrollableFrame(self.notebook, bg=self.colors["bg"])
             self.notebook.add(sf, text=name)
             self._tab_frames.append(sf)
             builder(sf.inner)
+
+        self._build_global_playback(outer)
 
         # Global controls
         ctrl = ttk.Frame(outer)
@@ -1069,6 +1279,215 @@ class App:
         frame.columnconfigure(1, weight=1)
         frame.columnconfigure(3, weight=1)
 
+    def _build_global_playback(self, parent: ttk.Frame) -> None:
+        play = ttk.LabelFrame(parent, text="Playback", padding=10)
+        play.pack(fill="x", pady=(8, 0))
+        play.columnconfigure(0, weight=1)
+
+        self.pb_now_playing = tk.StringVar(value="(no selection)")
+        ttk.Label(play, textvariable=self.pb_now_playing, wraplength=900).grid(
+            row=0, column=0, columnspan=4, sticky="w"
+        )
+
+        progress_row = ttk.Frame(play)
+        progress_row.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(8, 4))
+        progress_row.columnconfigure(1, weight=1)
+        self.pb_time_var = tk.StringVar(value="0:00 / 0:00")
+        ttk.Label(progress_row, textvariable=self.pb_time_var, width=14).grid(
+            row=0, column=0, padx=(0, 8)
+        )
+        self.pb_seek = ttk.Scale(
+            progress_row,
+            from_=0,
+            to=1000,
+            orient="horizontal",
+            command=self._on_playback_seek,
+        )
+        self.pb_seek.grid(row=0, column=1, sticky="ew")
+        self.pb_seek.bind("<ButtonPress-1>", self._on_playback_seek_press)
+        self.pb_seek.bind("<ButtonRelease-1>", self._on_playback_seek_release)
+
+        ctrl = ttk.Frame(play)
+        ctrl.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(4, 0))
+        ctrl.columnconfigure(3, weight=1)
+        self.pb_play_btn = ttk.Button(ctrl, text="Play", command=self._playback_toggle_pause)
+        self.pb_play_btn.grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(ctrl, text="Stop", command=self._playback_stop).grid(row=0, column=1, padx=(0, 16))
+        ttk.Label(ctrl, text="Volume").grid(row=0, column=2, padx=(0, 8))
+        vol = ttk.Scale(
+            ctrl,
+            from_=0,
+            to=100,
+            orient="horizontal",
+            variable=self.pb_volume,
+            command=self._on_playback_volume_changed,
+        )
+        vol.grid(row=0, column=3, sticky="ew", padx=(0, 16))
+        ttk.Label(ctrl, text="Output").grid(row=0, column=4, padx=(0, 8))
+        self.pb_device_combo = ttk.Combobox(
+            ctrl, textvariable=self.pb_device, width=36, state="readonly"
+        )
+        self.pb_device_combo.grid(row=0, column=5, sticky="ew")
+        self.pb_device_combo.bind("<<ComboboxSelected>>", self._on_playback_device_changed)
+        ttk.Button(ctrl, text="Refresh", command=self._refresh_playback_devices).grid(
+            row=0, column=6, padx=(8, 0)
+        )
+
+        self._refresh_playback_devices()
+        self._apply_playback_settings()
+
+    def _apply_playback_settings(self) -> None:
+        self._player.set_volume(self.pb_volume.get() / 100.0)
+        dev = self.pb_device.get().strip()
+        self._player.set_output_device(dev or SYSTEM_DEFAULT_DEVICE)
+
+    def _refresh_playback_devices(self) -> None:
+        devices = list_output_devices()
+        self.pb_device_combo["values"] = devices
+        cur = self.pb_device.get().strip()
+        if not devices:
+            self.pb_device.set("")
+            self._player.set_output_device(None)
+            self._save_settings()
+            return
+        if not cur or not any(device_label_matches(cur, d) for d in devices):
+            self.pb_device.set(pick_default_device_label(devices))
+        self._apply_playback_settings()
+        self._save_settings()
+
+    def _on_playback_volume_changed(self, _value: str = "") -> None:
+        self._player.set_volume(self.pb_volume.get() / 100.0)
+        self._save_settings()
+
+    def _on_playback_device_changed(self, _event: tk.Event | None = None) -> None:
+        self._player.set_output_device(self.pb_device.get())
+        self._save_settings()
+
+    def _on_playback_seek_press(self, _event: tk.Event | None = None) -> None:
+        self._pb_seeking = True
+
+    def _on_playback_seek_release(self, _event: tk.Event | None = None) -> None:
+        self._pb_seeking = False
+        try:
+            self._on_playback_seek(str(self.pb_seek.get()))
+        except tk.TclError:
+            pass
+
+    def _on_playback_seek(self, value: str) -> None:
+        if self._pb_ignore_seek:
+            return
+        player = self._player
+        if player.path is None:
+            return
+        dur = player.duration_ms
+        if dur <= 0:
+            return
+        try:
+            pct = float(value) / 1000.0
+        except (TypeError, ValueError):
+            return
+        target_ms = int(dur * pct)
+        player.seek(target_ms)
+        self.pb_time_var.set(f"{format_time_ms(target_ms)} / {format_time_ms(dur)}")
+        if player.state() == "playing" and self._playback_after_id is None:
+            self._playback_after_id = self.root.after(200, self._playback_tick)
+
+    def _playback_cancel_tick(self) -> None:
+        if self._playback_after_id is not None:
+            try:
+                self.root.after_cancel(self._playback_after_id)
+            except tk.TclError:
+                pass
+            self._playback_after_id = None
+
+    def _update_playback_ui(self) -> None:
+        if not hasattr(self, "pb_play_btn"):
+            return
+        player = self._player
+        state = player.state()
+        if player.path is not None:
+            self.pb_now_playing.set(str(player.path))
+        else:
+            self.pb_now_playing.set("(no selection)")
+        if state == "paused":
+            self.pb_play_btn.config(text="Resume")
+        elif state == "playing":
+            self.pb_play_btn.config(text="Pause")
+        else:
+            self.pb_play_btn.config(text="Play")
+        dur = player.duration_ms
+        pos = player.position_ms() if state in ("playing", "paused") else 0
+        if dur > 0 and state in ("playing", "paused"):
+            if not self._pb_seeking:
+                self._pb_ignore_seek = True
+                try:
+                    self.pb_seek.set(min(1000.0, pos / dur * 1000.0))
+                except tk.TclError:
+                    pass
+                self._pb_ignore_seek = False
+            self.pb_time_var.set(f"{format_time_ms(pos)} / {format_time_ms(dur)}")
+        else:
+            if not self._pb_seeking:
+                self._pb_ignore_seek = True
+                try:
+                    self.pb_seek.set(0)
+                except tk.TclError:
+                    pass
+                self._pb_ignore_seek = False
+            self.pb_time_var.set(
+                f"0:00 / {format_time_ms(dur)}" if dur > 0 else "0:00 / 0:00"
+            )
+
+    def _playback_tick(self) -> None:
+        self._playback_after_id = None
+        player = self._player
+        state = player.state()
+        if state == "playing":
+            if not player.is_busy():
+                player.stop()
+                self._update_playback_ui()
+                return
+            self._update_playback_ui()
+            self._playback_after_id = self.root.after(200, self._playback_tick)
+        elif state == "paused":
+            self._update_playback_ui()
+
+    def _playback_play_path(self, path: str) -> None:
+        try:
+            played = self._player.play(path)
+        except PlaybackError as exc:
+            self._refresh_playback_devices()
+            try:
+                played = self._player.play(path)
+            except PlaybackError:
+                messagebox.showerror("Playback error", str(exc))
+                return
+        self.pb_now_playing.set(str(played))
+        self._playback_cancel_tick()
+        self._update_playback_ui()
+        self._playback_after_id = self.root.after(200, self._playback_tick)
+
+    def _playback_toggle_pause(self) -> None:
+        state = self._player.state()
+        if state == "playing":
+            self._player.pause()
+            self._playback_cancel_tick()
+            self._update_playback_ui()
+            return
+        if state == "paused":
+            self._player.resume()
+            self._update_playback_ui()
+            self._playback_after_id = self.root.after(200, self._playback_tick)
+            return
+        path = self._src_selected_path()
+        if path:
+            self._playback_play_path(path)
+
+    def _playback_stop(self) -> None:
+        self._playback_cancel_tick()
+        self._player.stop()
+        self._update_playback_ui()
+
     # ---- Tab 0: Settings ----
 
     def _build_tab_settings(self, parent: ttk.Frame) -> None:
@@ -1098,18 +1517,36 @@ class App:
         ttk.Button(exp_btns, text="Browse", command=self._browse_active_exp).pack(
             side="left", padx=2
         )
+        ttk.Button(
+            exp_btns, textvariable=self.fav_exp_btn_label, command=self._toggle_favorite_experiment, width=9
+        ).pack(side="left", padx=2)
         ttk.Button(exp_btns, text="Clear", command=self._clear_active_experiment).pack(
             side="left", padx=2
         )
+
+        ttk.Label(exp, text="Favorites").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+        self.fav_exp_combo = ttk.Combobox(
+            exp,
+            textvariable=self.fav_exp_pick,
+            state="readonly",
+            width=56,
+        )
+        self.fav_exp_combo.grid(row=1, column=1, columnspan=2, sticky="ew", pady=4)
+        self.fav_exp_combo.bind("<<ComboboxSelected>>", self._apply_favorite_experiment)
+        ttk.Button(exp, text="Apply favorite", command=self._apply_favorite_experiment).grid(
+            row=1, column=3, columnspan=2, sticky="e", pady=4, padx=2
+        )
+
         ttk.Label(
             exp,
             text=(
                 "Browse logs/<exp_name> (e.g. logs/cx_20260802). "
+                "★ Fav saves it to Favorites for quick switch. "
                 "Fills Exp fields on all tabs and locks them until Clear."
             ),
             wraplength=900,
             justify="left",
-        ).grid(row=1, column=0, columnspan=5, sticky="w", pady=(8, 0))
+        ).grid(row=2, column=0, columnspan=5, sticky="w", pady=(8, 0))
 
         sep = ttk.LabelFrame(parent, text="Audio separator (Separate tab)", padding=10)
         sep.pack(fill="x", padx=4, pady=4)
@@ -1134,7 +1571,7 @@ class App:
 
         ttk.Label(
             parent,
-            text=f"Settings file: {SETTINGS_PATH}",
+            text=f"Local database: {DB_PATH}",
             wraplength=900,
         ).pack(anchor="w", padx=8, pady=8)
 
@@ -1186,659 +1623,774 @@ class App:
         except Exception as exc:
             self.python_path_display.set(f"(error: {exc})")
 
-    # ---- Tab 1: Preprocess ----
+    # ---- Tab 1: Audio Scan ----
 
-    def _build_tab_preprocess(self, parent: ttk.Frame) -> None:
-        f = ttk.LabelFrame(parent, text="Flexible preprocess", padding=10)
-        f.pack(fill="x", padx=4, pady=4)
-        self._configure_cols(f)
+    def _build_tab_audio_scan(self, parent: ttk.Frame) -> None:
+        roots_frame = ttk.LabelFrame(parent, text="Root directories", padding=10)
+        roots_frame.pack(fill="x", padx=4, pady=4)
+        self._configure_cols(roots_frame)
 
-        self._row_path(f, 0, "Input audio dir", self.pp_inp_root, self._browse_pp_inp)
-        pp_exp_entry, pp_exp_btn = self._row_path(
-            f, 1, "Exp dir", self.pp_exp_dir, self._browse_pp_exp, "Browse"
+        ttk.Label(
+            roots_frame,
+            text="Add folders to scan recursively (e.g. E:\\_haud). Saved in rvc_gui.db.",
+            wraplength=900,
+        ).grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 8))
+
+        list_wrap = ttk.Frame(roots_frame)
+        list_wrap.grid(row=1, column=0, columnspan=4, sticky="ew", pady=4)
+        list_wrap.columnconfigure(0, weight=1)
+        self.as_roots_list = tk.Listbox(
+            list_wrap,
+            height=5,
+            exportselection=False,
+            bg=self.colors["field"],
+            fg=self.colors["fg"],
+            selectbackground=self.colors.get("select_bg", "#3b8ed0"),
+            highlightthickness=0,
         )
-        self._register_exp_lock_widgets(pp_exp_entry, pp_exp_btn)
+        as_roots_sb = ttk.Scrollbar(list_wrap, orient="vertical", command=self.as_roots_list.yview)
+        self.as_roots_list.configure(yscrollcommand=as_roots_sb.set)
+        self.as_roots_list.grid(row=0, column=0, sticky="ew")
+        as_roots_sb.grid(row=0, column=1, sticky="ns")
 
-        ttk.Label(f, text="Sample rate").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
+        btns = ttk.Frame(roots_frame)
+        btns.grid(row=1, column=4, sticky="n", padx=(8, 0))
+        ttk.Button(btns, text="Add folder…", command=self._as_add_root).pack(fill="x", pady=2)
+        ttk.Button(btns, text="Remove", command=self._as_remove_root).pack(fill="x", pady=2)
+        ttk.Button(btns, text="Scan", command=self._as_start_scan).pack(fill="x", pady=(12, 2))
+
+        filt = ttk.Frame(roots_frame)
+        filt.grid(row=2, column=0, columnspan=5, sticky="ew", pady=(8, 0))
+        filt.columnconfigure(1, weight=1)
+        ttk.Label(filt, text="Filter").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(filt, textvariable=self.as_filter).grid(row=0, column=1, sticky="ew")
+        ttk.Label(filt, text="Kind").grid(row=0, column=2, sticky="w", padx=(12, 8))
         ttk.Combobox(
-            f, textvariable=self.pp_sr, values=["32000", "40000", "48000"], width=10, state="readonly"
-        ).grid(row=2, column=1, sticky="w", pady=4)
-
-        ttk.Label(f, text="Workers (n_p)").grid(row=2, column=2, sticky="e", padx=(8, 8), pady=4)
-        ttk.Entry(f, textvariable=self.pp_n_p, width=8).grid(row=2, column=3, sticky="w", pady=4)
-
-        ttk.Label(f, text="per (sec)").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(f, textvariable=self.pp_per, width=10).grid(row=3, column=1, sticky="w", pady=4)
-        ttk.Label(f, text="overlap").grid(row=3, column=2, sticky="e", padx=(8, 8), pady=4)
-        ttk.Entry(f, textvariable=self.pp_overlap, width=10).grid(row=3, column=3, sticky="w", pady=4)
-
-        ttk.Checkbutton(f, text="noparallel", variable=self.pp_noparallel).grid(
-            row=4, column=0, sticky="w", pady=4
+            filt,
+            textvariable=self.as_kind_filter,
+            values=KIND_FILTER_VALUES,
+            state="readonly",
+            width=10,
+        ).grid(row=0, column=3, sticky="w")
+        ttk.Button(filt, text="Apply", command=self._as_apply_filter).grid(
+            row=0, column=4, padx=(8, 0)
         )
-        ttk.Checkbutton(f, text="highpass", variable=self.pp_highpass).grid(
-            row=4, column=1, sticky="w", pady=4
+
+        self.as_status = tk.StringVar(value="No scan yet.")
+        ttk.Label(roots_frame, textvariable=self.as_status).grid(
+            row=3, column=0, columnspan=5, sticky="w", pady=(8, 0)
         )
-        ttk.Label(f, text="highpass Hz").grid(row=4, column=2, sticky="e", padx=(8, 8), pady=4)
-        ttk.Entry(f, textvariable=self.pp_highpass_hz, width=10).grid(row=4, column=3, sticky="w", pady=4)
 
-        slicer = ttk.LabelFrame(parent, text="Slicer", padding=10)
-        slicer.pack(fill="x", padx=4, pady=4)
-        self._configure_cols(slicer)
-        for i, (lab, var) in enumerate(
-            [
-                ("threshold", self.pp_threshold),
-                ("min_length", self.pp_min_length),
-                ("min_interval", self.pp_min_interval),
-                ("hop_size", self.pp_hop_size),
-                ("max_sil_kept", self.pp_max_sil_kept),
-            ]
-        ):
-            r, c = divmod(i, 3)
-            ttk.Label(slicer, text=lab).grid(row=r, column=c * 2, sticky="w", padx=(0, 6), pady=3)
-            ttk.Entry(slicer, textvariable=var, width=10).grid(row=r, column=c * 2 + 1, sticky="w", pady=3)
-
-        norm = ttk.LabelFrame(parent, text="Normalize", padding=10)
-        norm.pack(fill="x", padx=4, pady=4)
-        self._configure_cols(norm)
-        ttk.Label(norm, text="norm_max").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=3)
-        ttk.Entry(norm, textvariable=self.pp_norm_max, width=10).grid(row=0, column=1, sticky="w", pady=3)
-        ttk.Label(norm, text="norm_alpha").grid(row=0, column=2, sticky="w", padx=(12, 6), pady=3)
-        ttk.Entry(norm, textvariable=self.pp_norm_alpha, width=10).grid(row=0, column=3, sticky="w", pady=3)
-        ttk.Label(norm, text="peak_reject").grid(row=0, column=4, sticky="w", padx=(12, 6), pady=3)
-        ttk.Entry(norm, textvariable=self.pp_peak_reject, width=10).grid(row=0, column=5, sticky="w", pady=3)
-
-    def _browse_pp_inp(self) -> None:
-        path = filedialog.askdirectory(
-            title="Select input audio folder",
-            **self._path_dialog_opts(self.pp_inp_root.get()),
+        table = ttk.LabelFrame(parent, text="Audio files", padding=6)
+        table.pack(fill="both", expand=True, padx=4, pady=4)
+        cols = ("kind", "root", "rel", "name", "size", "path")
+        self.as_tree = ttk.Treeview(
+            table, columns=cols, show="headings", height=18, selectmode="browse"
         )
-        if path:
-            self.pp_inp_root.set(path)
+        headings = {
+            "kind": ("Kind", 70),
+            "root": ("Root", 120),
+            "rel": ("Relative path", 260),
+            "name": ("File", 160),
+            "size": ("Size", 80),
+            "path": ("Full path", 400),
+        }
+        for key, (label, width) in headings.items():
+            self.as_tree.heading(key, text=label)
+            anchor = "w"
+            self.as_tree.column(key, width=width, anchor=anchor, stretch=(key == "path"))
+        ysb = ttk.Scrollbar(table, orient="vertical", command=self.as_tree.yview)
+        xsb = ttk.Scrollbar(table, orient="horizontal", command=self.as_tree.xview)
+        self.as_tree.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        self.as_tree.grid(row=0, column=0, sticky="nsew")
+        ysb.grid(row=0, column=1, sticky="ns")
+        xsb.grid(row=1, column=0, sticky="ew")
+        table.rowconfigure(0, weight=1)
+        table.columnconfigure(0, weight=1)
+        try:
+            bg = self.colors["field"]
+            fg = self.colors["fg"]
+            self.as_tree.configure(style="Treeview")
+            style = ttk.Style(self.root)
+            style.configure("Treeview", background=bg, foreground=fg, fieldbackground=bg)
+            style.configure(
+                "Treeview.Heading",
+                background=self.colors["button"],
+                foreground=fg,
+            )
+        except tk.TclError:
+            pass
 
-    def _browse_pp_exp(self) -> None:
-        if self.exp_locked:
+    def _restore_audio_scan_from_settings(self) -> None:
+        self._as_refresh_roots_list()
+        self._audio_scan_rows = load_scan_cache(self._db)
+        if self._audio_scan_rows:
+            self._as_apply_filter()
+            self._refresh_source_list()
+
+    def _set_audio_scan_rows(self, rows: list[AudioFileRow]) -> None:
+        self._audio_scan_rows = rows
+        self._audio_scan_revision += 1
+        self._invalidate_source_display_cache()
+        try:
+            save_scan_cache(self._db, rows)
+        except OSError:
+            pass
+        self._as_apply_filter()
+        self._refresh_source_list()
+
+    def _as_refresh_roots_list(self) -> None:
+        if not hasattr(self, "as_roots_list"):
             return
+        self.as_roots_list.delete(0, tk.END)
+        for p in self.audio_scan_roots:
+            self.as_roots_list.insert(tk.END, p)
+
+    def _as_add_root(self) -> None:
         path = filedialog.askdirectory(
-            title="Select experiment folder",
-            **self._path_dialog_opts(self.pp_exp_dir.get()),
+            title="Select audio root directory",
+            **self._path_dialog_opts(
+                self.audio_scan_roots[-1] if self.audio_scan_roots else ""
+            ),
         )
-        if path:
-            self.pp_exp_dir.set(path)
+        if not path:
+            return
+        key = str(Path(path).resolve())
+        if any(p.lower() == key.lower() for p in self.audio_scan_roots):
+            messagebox.showinfo("Audio Scan", "Root already in list.")
+            return
+        self.audio_scan_roots.append(key)
+        self._as_refresh_roots_list()
+        self._save_settings()
 
-    # ---- Tab 2: Extract F0 ----
+    def _as_remove_root(self) -> None:
+        if not hasattr(self, "as_roots_list"):
+            return
+        sel = self.as_roots_list.curselection()
+        if not sel:
+            return
+        idx = int(sel[0])
+        if 0 <= idx < len(self.audio_scan_roots):
+            del self.audio_scan_roots[idx]
+            self._as_refresh_roots_list()
+            self._save_settings()
 
-    def _build_tab_extract_f0(self, parent: ttk.Frame) -> None:
-        f = ttk.LabelFrame(parent, text="Extract F0 (rmvpe / CUDA)", padding=10)
-        f.pack(fill="x", padx=4, pady=4)
-        self._configure_cols(f)
-        ttk.Label(f, text="Exp name").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
-        f0_exp_entry = ttk.Entry(f, textvariable=self.f0_exp)
-        f0_exp_entry.grid(row=0, column=1, sticky="ew", pady=4)
-        self._register_exp_lock_widgets(f0_exp_entry)
-        ttk.Label(f, text="GPU id").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(f, textvariable=self.f0_gpu, width=8).grid(row=1, column=1, sticky="w", pady=4)
-        ttk.Checkbutton(f, text="is_half", variable=self.f0_is_half).grid(row=2, column=1, sticky="w", pady=4)
-        ttk.Label(
-            f,
-            text="Runs: train/dataset/extract_f0.py cuda 1 0 <gpu> <exp> <is_half>",
-            wraplength=900,
-        ).grid(row=3, column=0, columnspan=5, sticky="w", pady=(8, 0))
+    def _as_start_scan(self) -> None:
+        if self._audio_scan_running:
+            return
+        if not self.audio_scan_roots:
+            messagebox.showinfo("Audio Scan", "Add at least one root directory.")
+            return
+        self._audio_scan_running = True
+        self.as_status.set("Scanning…")
+        roots = list(self.audio_scan_roots)
 
-    # ---- Tab 3: Extract HuBERT ----
+        def worker() -> None:
+            try:
+                rows = scan_audio_roots(roots)
+            except Exception as exc:
+                self.root.after(0, lambda: self._as_scan_failed(str(exc)))
+                return
+            self.root.after(0, lambda: self._as_scan_done(rows))
 
-    def _build_tab_extract_hubert(self, parent: ttk.Frame) -> None:
-        f = ttk.LabelFrame(parent, text="Extract HuBERT features", padding=10)
-        f.pack(fill="x", padx=4, pady=4)
-        self._configure_cols(f)
-        ttk.Label(f, text="Exp name").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
-        hb_exp_entry = ttk.Entry(f, textvariable=self.hb_exp)
-        hb_exp_entry.grid(row=0, column=1, sticky="ew", pady=4)
-        self._register_exp_lock_widgets(hb_exp_entry)
-        ttk.Label(f, text="GPU id").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(f, textvariable=self.hb_gpu, width=8).grid(row=1, column=1, sticky="w", pady=4)
-        ttk.Label(f, text="Version").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Combobox(
-            f, textvariable=self.hb_version, values=["v1", "v2"], width=8, state="readonly"
-        ).grid(row=2, column=1, sticky="w", pady=4)
-        ttk.Checkbutton(f, text="is_half", variable=self.hb_is_half).grid(row=3, column=1, sticky="w", pady=4)
-        ttk.Label(
-            f,
-            text="Runs: train/dataset/extract_hubert_feature.py cuda 1 0 <gpu> <exp> <version> <is_half>",
-            wraplength=900,
-        ).grid(row=4, column=0, columnspan=5, sticky="w", pady=(8, 0))
+        threading.Thread(target=worker, daemon=True).start()
 
-    # ---- Tab 4: Train ----
+    def _as_scan_failed(self, msg: str) -> None:
+        self._audio_scan_running = False
+        self.as_status.set(f"Scan failed: {msg}")
 
-    def _build_tab_train(self, parent: ttk.Frame) -> None:
-        f = ttk.LabelFrame(parent, text="Train", padding=10)
-        f.pack(fill="x", padx=4, pady=4)
-        self._configure_cols(f)
+    def _as_scan_done(self, rows: list[AudioFileRow]) -> None:
+        self._audio_scan_running = False
+        self._set_audio_scan_rows(rows)
 
-        ttk.Label(f, text="Exp name").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
-        tr_exp_entry = ttk.Entry(f, textvariable=self.tr_exp)
-        tr_exp_entry.grid(row=0, column=1, sticky="ew", pady=4)
-        self._register_exp_lock_widgets(tr_exp_entry)
-
-        ttk.Label(f, text="Sample rate").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Combobox(
-            f, textvariable=self.tr_sample_rate, values=["32k", "40k", "48k"], width=8, state="readonly"
-        ).grid(row=1, column=1, sticky="w", pady=4)
-        ttk.Label(f, text="Version").grid(row=1, column=2, sticky="e", padx=(8, 8), pady=4)
-        ttk.Combobox(
-            f, textvariable=self.tr_version, values=["v1", "v2"], width=8, state="readonly"
-        ).grid(row=1, column=3, sticky="w", pady=4)
-
-        ttk.Checkbutton(f, text="if_f0", variable=self.tr_if_f0).grid(row=2, column=0, sticky="w", pady=4)
-        ttk.Label(f, text="spk_id").grid(row=2, column=1, sticky="e", padx=(8, 8), pady=4)
-        ttk.Entry(f, textvariable=self.tr_spk_id, width=8).grid(row=2, column=2, sticky="w", pady=4)
-
-        ttk.Label(f, text="batch_size").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(f, textvariable=self.tr_batch_size, width=8).grid(row=3, column=1, sticky="w", pady=4)
-        ttk.Label(f, text="total_epoch").grid(row=3, column=2, sticky="e", padx=(8, 8), pady=4)
-        ttk.Entry(f, textvariable=self.tr_total_epoch, width=8).grid(row=3, column=3, sticky="w", pady=4)
-
-        ttk.Label(f, text="save_every_epoch").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(f, textvariable=self.tr_save_every_epoch, width=8).grid(row=4, column=1, sticky="w", pady=4)
-        ttk.Label(f, text="gpus").grid(row=4, column=2, sticky="e", padx=(8, 8), pady=4)
-        ttk.Entry(f, textvariable=self.tr_gpus, width=10).grid(row=4, column=3, sticky="w", pady=4)
-
-        self._row_path(f, 5, "pretrain G (opt)", self.tr_pretrain_g, self._browse_pretrain_g)
-        self._row_path(f, 6, "pretrain D (opt)", self.tr_pretrain_d, self._browse_pretrain_d)
-        ttk.Label(f, text="Blank pretrain = auto from assets/pretrained*").grid(
-            row=7, column=1, columnspan=4, sticky="w", pady=(0, 4)
+    def _as_apply_filter(self) -> None:
+        if not hasattr(self, "as_tree"):
+            return
+        for item in self.as_tree.get_children():
+            self.as_tree.delete(item)
+        rows = filter_rows(
+            self._audio_scan_rows,
+            self.as_filter.get(),
+            kind_filter=self.as_kind_filter.get(),
         )
-
-        ttk.Checkbutton(f, text="save_latest_only", variable=self.tr_save_latest_only).grid(
-            row=8, column=0, sticky="w", pady=4
-        )
-        ttk.Checkbutton(f, text="cache_in_gpu", variable=self.tr_cache_in_gpu).grid(
-            row=8, column=1, sticky="w", pady=4
-        )
-        ttk.Checkbutton(f, text="save_every_weights", variable=self.tr_save_every_weights).grid(
-            row=8, column=2, columnspan=2, sticky="w", pady=4
+        for r in rows:
+            root_short = Path(r.root).name or r.root
+            self.as_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    r.kind_label,
+                    root_short,
+                    r.rel_path,
+                    r.name,
+                    format_size(r.size_bytes),
+                    r.path,
+                ),
+            )
+        total_bytes = sum(r.size_bytes for r in rows)
+        roots_n = len({r.root for r in rows})
+        kind_parts = [
+            f"{k}={n}" for k, n in sorted(count_by_kind(self._audio_scan_rows).items()) if n
+        ]
+        kind_s = "  ".join(kind_parts) if kind_parts else ""
+        self.as_status.set(
+            f"showing={len(rows)}  roots={roots_n}  total={format_size(total_bytes)}"
+            + (f"  |  {kind_s}" if kind_s else "")
         )
 
-    def _browse_pretrain_g(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Select generator pretrained",
-            filetypes=PTH_FILETYPES,
-            **self._path_dialog_opts(self.tr_pretrain_g.get(), for_file=True),
-        )
-        if path:
-            self.tr_pretrain_g.set(path)
+    # ---- Tab 2: Source Audio ----
 
-    def _browse_pretrain_d(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Select discriminator pretrained",
-            filetypes=PTH_FILETYPES,
-            **self._path_dialog_opts(self.tr_pretrain_d.get(), for_file=True),
-        )
-        if path:
-            self.tr_pretrain_d.set(path)
-
-    # ---- Tab 5: Train Metrics ----
-
-    def _build_tab_train_metrics(self, parent: ttk.Frame) -> None:
-        ctrl = ttk.LabelFrame(parent, text="Source", padding=10)
+    def _build_tab_source_audio(self, parent: ttk.Frame) -> None:
+        ctrl = ttk.LabelFrame(parent, text="Source files from last scan", padding=10)
         ctrl.pack(fill="x", padx=4, pady=4)
         self._configure_cols(ctrl)
 
-        ttk.Label(ctrl, text="Exp name").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
-        self.metrics_exp = tk.StringVar(value=self.tr_exp.get() or "my_exp")
-        ttk.Entry(ctrl, textvariable=self.metrics_exp).grid(
-            row=0, column=1, sticky="ew", pady=4
+        ttk.Label(
+            ctrl,
+            text="Click a Note cell to edit (saved automatically). Double-click other columns to play.",
+            wraplength=900,
+        ).grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 8))
+
+        filt = ttk.Frame(ctrl)
+        filt.grid(row=1, column=0, columnspan=5, sticky="ew")
+        filt.columnconfigure(1, weight=1)
+        ttk.Label(filt, text="Filter").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(filt, textvariable=self.src_filter).grid(row=0, column=1, sticky="ew")
+        ttk.Button(filt, text="Apply", command=self._refresh_source_list).grid(
+            row=0, column=2, padx=(8, 0)
         )
-        btns = ttk.Frame(ctrl)
-        btns.grid(row=0, column=2, columnspan=3, sticky="e", pady=4)
-        ttk.Button(btns, text="Use active/train exp", command=self._metrics_use_active_exp).pack(
-            side="left", padx=2
+        ttk.Button(filt, text="Play selected", command=self._src_play_selected).grid(
+            row=0, column=3, padx=(8, 0)
         )
-        ttk.Button(btns, text="Refresh", command=self._refresh_train_metrics).pack(
-            side="left", padx=2
+        ttk.Button(filt, text="Process", command=self._src_go_process, style=BTN_STYLE_PROCESS).grid(
+            row=0, column=4, padx=(8, 0)
         )
 
-        self.metrics_status = tk.StringVar(value="Click Refresh to load train.log metrics.")
-        ttk.Label(ctrl, textvariable=self.metrics_status, wraplength=900).grid(
-            row=1, column=0, columnspan=5, sticky="w", pady=(6, 0)
+        sort_row = ttk.Frame(ctrl)
+        sort_row.grid(row=2, column=0, columnspan=5, sticky="ew", pady=(8, 0))
+        ttk.Label(sort_row, text="Sort by").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.src_sort_combo = ttk.Combobox(
+            sort_row,
+            textvariable=self.src_sort_label,
+            values=list(SRC_SORT_LABELS.values()),
+            state="readonly",
+            width=18,
         )
-
-        opts = ttk.Frame(ctrl)
-        opts.grid(row=2, column=0, columnspan=5, sticky="w", pady=(8, 0))
-        self.metrics_only_weights = tk.BooleanVar(value=False)
-        self.metrics_sort_mel = tk.BooleanVar(value=False)
+        self.src_sort_combo.grid(row=0, column=1, sticky="w")
+        self.src_sort_combo.bind("<<ComboboxSelected>>", self._on_src_sort_changed)
         ttk.Checkbutton(
-            opts, text="Only epochs with exported .pth", variable=self.metrics_only_weights
-        ).pack(side="left", padx=(0, 12))
-        ttk.Checkbutton(
-            opts, text="Sort by mel (low first)", variable=self.metrics_sort_mel
-        ).pack(side="left")
+            sort_row,
+            text="Descending",
+            variable=self.src_sort_desc,
+            command=self._on_src_sort_changed,
+        ).grid(row=0, column=2, padx=(12, 0), sticky="w")
 
-        table = ttk.LabelFrame(parent, text="Epoch metrics (last log sample wins if resumed)", padding=6)
+        self.src_status = tk.StringVar(value="No source files yet.")
+        ttk.Label(ctrl, textvariable=self.src_status).grid(
+            row=3, column=0, columnspan=5, sticky="w", pady=(8, 0)
+        )
+
+        table = ttk.LabelFrame(parent, text="Source audio", padding=6)
         table.pack(fill="both", expand=True, padx=4, pady=4)
-        cols = ("epoch", "mel", "kl", "disc", "gen", "fm", "weight")
-        self.metrics_tree = ttk.Treeview(
-            table, columns=cols, show="headings", height=16, selectmode="browse"
+        self.src_tree = ttk.Treeview(
+            table, columns=SRC_TREE_COLUMNS, show="headings", height=18, selectmode="browse"
         )
         headings = {
-            "epoch": ("Epoch", 70),
-            "mel": ("mel", 80),
-            "kl": ("kl", 80),
-            "disc": ("disc", 80),
-            "gen": ("gen", 80),
-            "fm": ("fm", 80),
-            "weight": ("weight file", 420),
+            "root": "Root",
+            "rel": "Relative path",
+            "name": "File",
+            "size": "Size",
+            "note": "Note",
+            "converted": "Cvt",
+            "path": "Full path",
         }
-        for key, (label, width) in headings.items():
-            self.metrics_tree.heading(key, text=label)
-            self.metrics_tree.column(key, width=width, anchor="center" if key != "weight" else "w")
-        ysb = ttk.Scrollbar(table, orient="vertical", command=self.metrics_tree.yview)
-        xsb = ttk.Scrollbar(table, orient="horizontal", command=self.metrics_tree.xview)
-        self.metrics_tree.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
-        self.metrics_tree.grid(row=0, column=0, sticky="nsew")
+        for key, label in headings.items():
+            self.src_tree.heading(key, text=label)
+            width = self._src_tree_col_widths.get(key, SRC_TREE_COL_DEFAULTS[key])
+            anchor = "center" if key in ("note", "converted") else "w"
+            self.src_tree.column(
+                key,
+                width=width,
+                anchor=anchor,
+                stretch=(key in ("note", "path")),
+            )
+        ysb = ttk.Scrollbar(table, orient="vertical", command=self.src_tree.yview)
+        xsb = ttk.Scrollbar(table, orient="horizontal", command=self.src_tree.xview)
+        self.src_tree.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        self.src_tree.grid(row=0, column=0, sticky="nsew")
         ysb.grid(row=0, column=1, sticky="ns")
         xsb.grid(row=1, column=0, sticky="ew")
         table.rowconfigure(0, weight=1)
         table.columnconfigure(0, weight=1)
 
-        tip = (
-            "mel/kl/... are sparse training-batch samples (not full-epoch averages). "
-            "Use Infer A/B to judge sound. Index does not need rebuild after epoch-only continue."
-        )
-        ttk.Label(parent, text=tip, wraplength=960).pack(anchor="w", padx=8, pady=6)
-
-        self.metrics_only_weights.trace_add("write", lambda *_a: self._refresh_train_metrics())
-        self.metrics_sort_mel.trace_add("write", lambda *_a: self._refresh_train_metrics())
-
-    def _metrics_use_active_exp(self) -> None:
-        name = self.exp_name(self.active_exp_path.get()) or self.exp_name(self.tr_exp.get())
-        if name:
-            self.metrics_exp.set(name)
-        self._refresh_train_metrics()
-
-    def _refresh_train_metrics(self) -> None:
-        if not hasattr(self, "metrics_tree"):
-            return
-        for item in self.metrics_tree.get_children():
-            self.metrics_tree.delete(item)
-
-        root = self._configured_root()
-        if root is None:
-            try:
-                root = resolve_rvc_root(self.rvc_root.get().strip() or None)
-            except FileNotFoundError:
-                self.metrics_status.set("Set RVC root first.")
-                return
-
-        exp = self.exp_name(self.metrics_exp.get()) or self.exp_name(self.tr_exp.get())
-        if not exp:
-            self.metrics_status.set("Enter an experiment name.")
-            return
-
-        log_path = root / "logs" / exp / "train.log"
-        weights_dir = root / "assets" / "weights"
-        metrics = parse_train_log(log_path)
-        weights = find_weight_files(weights_dir, exp)
-        rows = merge_metrics_with_weights(metrics, weights)
-
-        if self.metrics_only_weights.get():
-            rows = [r for r in rows if r.weight_path]
-        if self.metrics_sort_mel.get():
-            rows = sorted(
-                rows,
-                key=lambda r: (
-                    r.loss_mel != r.loss_mel,
-                    r.loss_mel if r.loss_mel == r.loss_mel else 1e9,
-                    r.epoch,
-                ),
-            )
-        else:
-            rows = sorted(rows, key=lambda r: r.epoch)
-
-        def fmt(v: float) -> str:
-            if v != v:  # NaN
-                return ""
-            return f"{v:.3f}"
-
-        for r in rows:
-            wname = Path(r.weight_path).name if r.weight_path else ""
-            self.metrics_tree.insert(
-                "",
-                "end",
-                values=(
-                    r.epoch,
-                    fmt(r.loss_mel),
-                    fmt(r.loss_kl),
-                    fmt(r.loss_disc),
-                    fmt(r.loss_gen),
-                    fmt(r.loss_fm),
-                    wname,
-                ),
-            )
-
-        with_w = sum(1 for r in rows if r.weight_path)
-        best = None
-        for r in rows:
-            if r.loss_mel == r.loss_mel and (best is None or r.loss_mel < best.loss_mel):
-                best = r
-        best_s = (
-            f" lowest mel in view: e{best.epoch}={best.loss_mel:.3f}" if best is not None else ""
-        )
-        self.metrics_status.set(
-            f"{log_path} | rows={len(rows)} weights={with_w}/{len(weights)}{best_s}"
-        )
-
-    # ---- Tab 6: Build Index ----
-
-    def _build_tab_build_index(self, parent: ttk.Frame) -> None:
-        f = ttk.LabelFrame(parent, text="Build FAISS index", padding=10)
-        f.pack(fill="x", padx=4, pady=4)
-        self._configure_cols(f)
-
-        ttk.Label(f, text="Exp name").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
-        ix_exp_entry = ttk.Entry(f, textvariable=self.ix_exp)
-        ix_exp_entry.grid(row=0, column=1, sticky="ew", pady=4)
-        self._register_exp_lock_widgets(ix_exp_entry)
-        ttk.Label(f, text="Version").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Combobox(
-            f, textvariable=self.ix_version, values=["v1", "v2"], width=8, state="readonly"
-        ).grid(row=1, column=1, sticky="w", pady=4)
-        self._row_path(f, 2, "Outside index dir", self.ix_outside, self._browse_ix_outside)
-        ttk.Label(f, text="n_cpu").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(f, textvariable=self.ix_n_cpu, width=8).grid(row=3, column=1, sticky="w", pady=4)
-        ttk.Label(
-            f,
-            text="Runs: train/train_index.py <exp_name> <version> <outside_index_dir> <n_cpu>",
-            wraplength=900,
-        ).grid(row=4, column=0, columnspan=5, sticky="w", pady=(8, 0))
-
-    def _browse_ix_outside(self) -> None:
-        path = filedialog.askdirectory(
-            title="Select outside index directory",
-            **self._path_dialog_opts(self.ix_outside.get()),
-        )
-        if path:
-            self.ix_outside.set(path)
-
-    # ---- Tab 6: Infer A/B ----
-
-    def _build_tab_infer_ab(self, parent: ttk.Frame) -> None:
-        f = ttk.LabelFrame(parent, text="Short-clip multi-weight test", padding=10)
-        f.pack(fill="x", padx=4, pady=4)
-        self._configure_cols(f)
-
-        self._row_path(f, 0, "Test audio", self.ab_input, self._browse_ab_input)
-        self._row_path(f, 1, "Weights dir", self.ab_weights_dir, self._browse_ab_weights_dir)
-        self._row_path(f, 2, "Index (opt)", self.ab_index, self._browse_ab_index)
-        ab_out_entry, ab_out_btn = self._row_path(
-            f, 3, "Output dir", self.ab_out_dir, self._browse_ab_out_dir
-        )
-        self._register_exp_lock_widgets(ab_out_entry, ab_out_btn)
-
-        ttk.Label(f, text="Filter").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(f, textvariable=self.ab_filter).grid(row=4, column=1, sticky="ew", pady=4)
-        btns = ttk.Frame(f)
-        btns.grid(row=4, column=2, columnspan=3, sticky="e", pady=4)
-        ttk.Button(btns, text="Refresh", command=self._refresh_weights_list).pack(side="left", padx=2)
-        ttk.Button(btns, text="All", command=lambda: self._set_all_weights(True)).pack(side="left", padx=2)
-        ttk.Button(btns, text="None", command=lambda: self._set_all_weights(False)).pack(side="left", padx=2)
-        ttk.Button(btns, text="Every 10", command=self._select_every_10_epochs).pack(side="left", padx=2)
-
-        list_frame = ttk.LabelFrame(parent, text="Weights (.pth)", padding=6)
-        list_frame.pack(fill="both", expand=True, padx=4, pady=4)
-        self.weights_canvas = tk.Canvas(
-            list_frame, height=140, highlightthickness=0, bg=self.colors["field"]
-        )
-        wsb = ttk.Scrollbar(list_frame, orient="vertical", command=self.weights_canvas.yview)
-        self.weights_inner = ttk.Frame(self.weights_canvas)
-        self.weights_canvas.create_window((0, 0), window=self.weights_inner, anchor="nw")
-        self.weights_canvas.configure(yscrollcommand=wsb.set)
-        self.weights_inner.bind(
-            "<Configure>",
-            lambda _e: self.weights_canvas.configure(scrollregion=self.weights_canvas.bbox("all")),
-        )
-        self.weights_canvas.pack(side="left", fill="both", expand=True)
-        wsb.pack(side="right", fill="y")
-
-        params = ttk.LabelFrame(parent, text="Infer params", padding=10)
-        params.pack(fill="x", padx=4, pady=4)
-        self._configure_cols(params)
-
-        ttk.Label(params, text="pitch").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=3)
-        ttk.Entry(params, textvariable=self.ab_pitch, width=8).grid(row=0, column=1, sticky="w", pady=3)
-        ttk.Label(params, text="f0 method").grid(row=0, column=2, sticky="e", padx=(8, 6), pady=3)
-        ttk.Combobox(
-            params,
-            textvariable=self.ab_f0_method,
-            values=["rmvpe", "pm", "fcpe"],
-            width=10,
-            state="readonly",
-        ).grid(row=0, column=3, sticky="w", pady=3)
-
-        ttk.Label(params, text="index_rate").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=3)
-        ttk.Entry(params, textvariable=self.ab_index_rate, width=8).grid(row=1, column=1, sticky="w", pady=3)
-        ttk.Label(params, text="protect").grid(row=1, column=2, sticky="e", padx=(8, 6), pady=3)
-        ttk.Entry(params, textvariable=self.ab_protect, width=8).grid(row=1, column=3, sticky="w", pady=3)
-
-        ttk.Label(params, text="rms_mix").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=3)
-        ttk.Entry(params, textvariable=self.ab_rms, width=8).grid(row=2, column=1, sticky="w", pady=3)
-        ttk.Label(params, text="breath_mix").grid(row=2, column=2, sticky="e", padx=(8, 6), pady=3)
-        ttk.Entry(params, textvariable=self.ab_breath_mix, width=8).grid(row=2, column=3, sticky="w", pady=3)
-
-        ttk.Label(params, text="resample_sr").grid(row=3, column=0, sticky="w", padx=(0, 6), pady=3)
-        ttk.Entry(params, textvariable=self.ab_resample, width=8).grid(row=3, column=1, sticky="w", pady=3)
-        ttk.Label(params, text="spk_id").grid(row=3, column=2, sticky="e", padx=(8, 6), pady=3)
-        ttk.Entry(params, textvariable=self.ab_spk, width=8).grid(row=3, column=3, sticky="w", pady=3)
-
-        ttk.Label(
-            params,
-            text="breath_mix: unvoiced/sigh mix of source breath (0=off). Needs 0718+ patched RVC.",
-            wraplength=880,
-        ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(2, 0))
-
-        play = ttk.LabelFrame(parent, text="Playback / results", padding=10)
-        play.pack(fill="x", padx=4, pady=4)
-        self._configure_cols(play)
-
-        ttk.Label(play, text="Output device").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
-        self.ab_device_combo = ttk.Combobox(play, textvariable=self.ab_device, width=60, state="readonly")
-        self.ab_device_combo.grid(row=0, column=1, columnspan=2, sticky="ew", pady=4)
-        ttk.Button(play, text="Refresh devices", command=self._refresh_ab_devices).grid(
-            row=0, column=3, padx=(8, 0), pady=4
-        )
-
-        ttk.Label(play, text="Result").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
-        self.ab_result_combo = ttk.Combobox(play, values=[], width=60, state="readonly")
-        self.ab_result_combo.grid(row=1, column=1, columnspan=2, sticky="ew", pady=4)
-        rbtns = ttk.Frame(play)
-        rbtns.grid(row=1, column=3, sticky="e", pady=4)
-        ttk.Button(rbtns, text="Reload", command=self._reload_ab_results).pack(side="left", padx=2)
-        ttk.Button(rbtns, text="Play", command=self._play_ab_result).pack(side="left", padx=2)
-        ttk.Button(rbtns, text="Stop", command=self._stop_playback).pack(side="left", padx=2)
-
-    def _browse_ab_input(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Select test audio",
-            filetypes=AUDIO_FILETYPES,
-            **self._path_dialog_opts(self.ab_input.get(), for_file=True),
-        )
-        if path:
-            self.ab_input.set(path)
-
-    def _browse_ab_weights_dir(self) -> None:
-        path = filedialog.askdirectory(
-            title="Select weights folder",
-            **self._path_dialog_opts(self.ab_weights_dir.get()),
-        )
-        if path:
-            self.ab_weights_dir.set(path)
-            self._refresh_weights_list()
-
-    def _browse_ab_index(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Select index file",
-            filetypes=[("Index Files", "*.index"), ("All Files", "*.*")],
-            **self._path_dialog_opts(self.ab_index.get(), for_file=True),
-        )
-        if path:
-            self.ab_index.set(path)
-
-    def _browse_ab_out_dir(self) -> None:
-        if self.exp_locked:
-            return
-        path = filedialog.askdirectory(
-            title="Select infer output folder",
-            **self._path_dialog_opts(self.ab_out_dir.get()),
-        )
-        if path:
-            self.ab_out_dir.set(path)
-
-    def _refresh_weights_list(self) -> None:
-        for child in self.weights_inner.winfo_children():
-            child.destroy()
-        self._weight_vars.clear()
-
-        wdir = self.ab_weights_dir.get().strip()
-        if not wdir:
-            root = self._configured_root()
-            if root:
-                wdir = str(root / "assets" / "weights")
-                self.ab_weights_dir.set(wdir)
-        folder = Path(wdir) if wdir else None
-        if folder is None or not folder.is_dir():
-            ttk.Label(self.weights_inner, text="(weights folder not found — set path and Refresh)").pack(
-                anchor="w"
-            )
-            return
-
-        filt = self.ab_filter.get().strip().lower()
-        files = sorted(p for p in folder.iterdir() if p.is_file() and p.suffix.lower() == ".pth")
-        if filt:
-            files = [p for p in files if filt in p.name.lower()]
-        if not files:
-            ttk.Label(self.weights_inner, text="(no .pth files)").pack(anchor="w")
-            return
-        for p in files:
-            var = tk.BooleanVar(value=False)
-            self._weight_vars[str(p)] = var
-            ttk.Checkbutton(self.weights_inner, text=p.name, variable=var).pack(anchor="w")
-
-    def _set_all_weights(self, value: bool) -> None:
-        for var in self._weight_vars.values():
-            var.set(value)
-
-    def _select_every_10_epochs(self) -> None:
-        """Select weights whose epoch number (e_NNN or _eNNN_) is divisible by 10."""
-        for path, var in self._weight_vars.items():
-            name = Path(path).stem
-            m = re.search(r"(?:^|[_\-])e(\d+)(?:[_\-]|$)", name, re.IGNORECASE)
-            if not m:
-                # Also try trailing _NNN
-                m = re.search(r"_(\d+)$", name)
-            if m:
-                epoch = int(m.group(1))
-                var.set(epoch % 10 == 0 or epoch == 0)
-            else:
-                var.set(False)
-
-    def _selected_weights(self) -> list[str]:
-        return [p for p, v in self._weight_vars.items() if v.get()]
-
-    def _refresh_ab_devices(self) -> None:
-        devices: list[str] = []
         try:
-            import sounddevice as sd
-
-            for i, d in enumerate(sd.query_devices()):
-                if int(d.get("max_output_channels", 0) or 0) > 0:
-                    devices.append(f"{i}: {d['name']}")
-        except Exception as exc:
-            devices = [f"(sounddevice unavailable: {exc})"]
-        self.ab_device_combo["values"] = devices
-        cur = self.ab_device.get()
-        if devices and cur not in devices:
-            # Prefer default output if present
-            try:
-                import sounddevice as sd
-
-                default = sd.default.device
-                out_idx = default[1] if isinstance(default, (list, tuple)) else default
-                for item in devices:
-                    if item.startswith(f"{out_idx}:"):
-                        self.ab_device.set(item)
-                        break
-                else:
-                    self.ab_device.set(devices[0])
-            except Exception:
-                self.ab_device.set(devices[0])
-
-    def _reload_ab_results(self) -> None:
-        out_dir = self.ab_out_dir.get().strip()
-        if not out_dir:
-            out_dir = self._rvc_path("logs", "my_exp", "infer_ab_test")
-            self.ab_out_dir.set(out_dir)
-        man = Path(out_dir) / "manifest.json"
-        labels: list[str] = []
-        self._result_paths = []
-        if man.is_file():
-            try:
-                data = json.loads(man.read_text(encoding="utf-8"))
-                for item in data.get("items", []):
-                    out = item.get("out") or ""
-                    weight = item.get("weight") or Path(out).name
-                    if out and Path(out).is_file():
-                        labels.append(f"{weight} -> {Path(out).name}")
-                        self._result_paths.append(out)
-                src = data.get("source_copy") or data.get("input")
-                if src and Path(src).is_file():
-                    labels.insert(0, f"[source] {Path(src).name}")
-                    self._result_paths.insert(0, src)
-            except Exception as exc:
-                messagebox.showerror("Manifest error", str(exc))
-        else:
-            # Fall back to wav listing
-            folder = Path(out_dir)
-            if folder.is_dir():
-                for p in sorted(folder.glob("*.wav")):
-                    labels.append(p.name)
-                    self._result_paths.append(str(p))
-        self.ab_result_combo["values"] = labels
-        if labels:
-            self.ab_result_combo.current(0)
-
-    def _play_ab_result(self) -> None:
-        self._stop_playback()
-        idx = self.ab_result_combo.current()
-        if idx < 0 or idx >= len(self._result_paths):
-            messagebox.showwarning("No result", "Select a result or Reload from manifest.")
-            return
-        path = self._result_paths[idx]
-        try:
-            import sounddevice as sd
-            import soundfile as sf
-
-            data, sr = sf.read(path, always_2d=True)
-            device = None
-            raw = self.ab_device.get().strip()
-            if raw and ":" in raw:
-                try:
-                    device = int(raw.split(":", 1)[0].strip())
-                except ValueError:
-                    device = None
-            sd.play(data, sr, device=device)
-            self._playback = (data, sr)
-        except Exception as exc:
-            messagebox.showerror("Playback error", str(exc))
-
-    def _stop_playback(self) -> None:
-        try:
-            import sounddevice as sd
-
-            sd.stop()
-        except Exception:
+            bg = self.colors["field"]
+            fg = self.colors["fg"]
+            self.src_tree.configure(style="Treeview")
+            style = ttk.Style(self.root)
+            style.configure("Treeview", background=bg, foreground=fg, fieldbackground=bg)
+            style.configure(
+                "Treeview.Heading",
+                background=self.colors["button"],
+                foreground=fg,
+            )
+        except tk.TclError:
             pass
-        self._playback = None
 
-    # ---- Tab 8: Separate ----
+        self.src_tree.bind("<Double-1>", self._src_on_tree_double_click)
+        self.src_tree.bind("<Button-1>", self._src_on_tree_click, add="+")
+        self.src_tree.bind("<ButtonRelease-1>", self._on_src_tree_column_resize, add="+")
+        self.src_tree.bind("<<TreeviewSelect>>", self._on_src_tree_select)
+
+    @staticmethod
+    def _parse_src_tree_col_widths(raw: object) -> dict[str, int]:
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[str, int] = {}
+        for key in SRC_TREE_COLUMNS:
+            if key not in raw:
+                continue
+            try:
+                width = int(raw[key])
+            except (TypeError, ValueError):
+                continue
+            if width >= 40:
+                out[key] = width
+        return out
+
+    def _capture_src_tree_col_widths(self) -> None:
+        if not hasattr(self, "src_tree"):
+            return
+        widths: dict[str, int] = {}
+        for key in SRC_TREE_COLUMNS:
+            try:
+                width = int(self.src_tree.column(key, "width"))
+            except (tk.TclError, TypeError, ValueError):
+                continue
+            if width >= 40:
+                widths[key] = width
+        if widths:
+            self._src_tree_col_widths = widths
+
+    def _apply_src_tree_col_widths(self) -> None:
+        if not hasattr(self, "src_tree"):
+            return
+        for key in SRC_TREE_COLUMNS:
+            width = self._src_tree_col_widths.get(key, SRC_TREE_COL_DEFAULTS[key])
+            try:
+                self.src_tree.column(key, width=width)
+            except tk.TclError:
+                pass
+
+    def _on_src_tree_column_resize(self, event: tk.Event) -> None:
+        if not hasattr(self, "src_tree"):
+            return
+        region = self.src_tree.identify_region(event.x, event.y)
+        if region != "separator":
+            return
+        self._capture_src_tree_col_widths()
+        self._save_settings()
+
+    def _on_src_tree_select(self, _event: tk.Event | None = None) -> None:
+        path = self._src_selected_path()
+        if path:
+            self._set_convert_context_for_source(path)
+
+    def _set_convert_context_for_source(
+        self,
+        source_path: str,
+        *,
+        vocals: str | None = None,
+        inst: str | None = None,
+    ) -> None:
+        if not source_path.strip() or not Path(source_path).is_file():
+            return
+        self._convert_source_path = str(Path(source_path).resolve())
+        if vocals is None or inst is None:
+            found_v, found_i = find_separated_for_source(
+                source_path, self._audio_scan_rows, self._stem_links
+            )
+            vocals = vocals or found_v
+            inst = inst or found_i
+        if vocals:
+            self.im_input_path.set(vocals)
+        if inst:
+            self.im_bgm_path.set(inst)
+        self._ensure_convert_stem_paths(self._convert_source_path)
+        self._refresh_im_auto_paths()
+        self._refresh_convert_results_list()
+
+    def _src_note_column_id(self) -> str:
+        return "#5"
+
+    def _src_destroy_note_editor(self) -> None:
+        if self._src_note_editor is not None:
+            try:
+                self._src_note_editor.destroy()
+            except tk.TclError:
+                pass
+        self._src_note_editor = None
+        self._src_note_edit_item = None
+        self._src_note_edit_path = None
+
+    def _src_begin_note_edit(self, item: str) -> None:
+        if not item:
+            return
+        vals = self.src_tree.item(item, "values")
+        if not vals or len(vals) < 7:
+            return
+        path = str(vals[6]).strip()
+        if not path:
+            return
+        self._src_destroy_note_editor()
+        bbox = self.src_tree.bbox(item, column="note")
+        if not bbox:
+            return
+        x, y, w, h = bbox
+        note = get_source_note(path, self._stem_links)
+        try:
+            bg = self.colors["field"]
+            fg = self.colors["fg"]
+        except Exception:
+            bg = "white"
+            fg = "black"
+        entry = tk.Entry(
+            self.src_tree,
+            borderwidth=0,
+            highlightthickness=1,
+            bg=bg,
+            fg=fg,
+        )
+        entry.insert(0, note)
+        entry.select_range(0, tk.END)
+        entry.place(x=x, y=y, width=max(w, 80), height=h)
+        entry.focus_set()
+        self._src_note_editor = entry
+        self._src_note_edit_item = item
+        self._src_note_edit_path = path
+        entry.bind("<Return>", self._src_commit_note_edit)
+        entry.bind("<Escape>", self._src_cancel_note_edit)
+        entry.bind("<FocusOut>", self._src_commit_note_edit)
+
+    def _src_commit_note_edit(self, _event: tk.Event | None = None) -> None:
+        if self._src_note_committing:
+            return
+        editor = self._src_note_editor
+        item = self._src_note_edit_item
+        path = self._src_note_edit_path
+        if editor is None or not item or not path:
+            self._src_destroy_note_editor()
+            return
+        self._src_note_committing = True
+        try:
+            note = editor.get()
+            if set_source_note(self._stem_links, path, note):
+                self._persist_stem_links()
+            vals = list(self.src_tree.item(item, "values"))
+            if len(vals) >= 7:
+                vals[4] = note
+                self.src_tree.item(item, values=vals)
+        finally:
+            self._src_destroy_note_editor()
+            self._src_note_committing = False
+
+    def _src_cancel_note_edit(self, _event: tk.Event | None = None) -> None:
+        self._src_destroy_note_editor()
+
+    def _src_on_tree_click(self, event: tk.Event) -> None:
+        if self.src_tree.identify_region(event.x, event.y) != "cell":
+            return
+        if self.src_tree.identify_column(event.x) != self._src_note_column_id():
+            return
+        item = self.src_tree.identify_row(event.y)
+        if item:
+            self.root.after_idle(lambda i=item: self._src_begin_note_edit(i))
+
+    def _src_on_tree_double_click(self, event: tk.Event) -> None:
+        if self.src_tree.identify_column(event.x) == self._src_note_column_id():
+            return
+        self._src_play_selected()
+
+    def _on_src_sort_changed(self, _event: tk.Event | None = None) -> None:
+        self._refresh_source_list(sort_only=True)
+        self._save_settings()
+
+    def _src_selected_path(self) -> str | None:
+        if not hasattr(self, "src_tree"):
+            return None
+        sel = self.src_tree.selection()
+        if not sel:
+            return None
+        vals = self.src_tree.item(sel[0], "values")
+        if not vals or len(vals) < 7:
+            return None
+        path = str(vals[6]).strip()
+        return path if path and Path(path).is_file() else None
+
+    def _src_play_selected(self) -> None:
+        path = self._src_selected_path()
+        if not path:
+            messagebox.showinfo("Source Audio", "Select a file in the list first.")
+            return
+        self._playback_play_path(path)
+
+    def _src_go_process(self) -> None:
+        path = self._src_selected_path()
+        if not path:
+            messagebox.showinfo("Source Audio", "Select a file in the list first.")
+            return
+        self._process_source_path = path
+        self._refresh_process_tab()
+        self.notebook.select(TAB_PROCESS)
+
+    def _refresh_source_list(self, *, sort_only: bool = False) -> None:
+        if not hasattr(self, "src_tree"):
+            return
+        self._src_destroy_note_editor()
+        for item in self.src_tree.get_children():
+            self.src_tree.delete(item)
+        rows = filter_rows(
+            self._audio_scan_rows,
+            self.src_filter.get(),
+            kind_filter="source",
+        )
+        cache_key = self._source_display_cache_key()
+        if (
+            sort_only
+            and cache_key == self._src_display_cache_key
+            and self._src_display_cache_payload is not None
+        ):
+            payload = self._src_display_cache_payload
+        else:
+            payload = self._build_source_display_payload(rows)
+            self._src_display_cache_key = cache_key
+            self._src_display_cache_payload = payload
+
+        sorted_rows = sort_rows(
+            [item[0] for item in payload],
+            sort_key_from_label(self.src_sort_label.get()),
+            descending=bool(self.src_sort_desc.get()),
+        )
+        by_path = {item[0].path: item for item in payload}
+        for r in sorted_rows:
+            item = by_path.get(r.path)
+            if item is None:
+                continue
+            row, note, cvt_n = item
+            root_short = Path(row.root).name or row.root
+            self.src_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    root_short,
+                    row.rel_path,
+                    row.name,
+                    format_size(row.size_bytes),
+                    note,
+                    str(cvt_n),
+                    row.path,
+                ),
+            )
+        total_bytes = sum(r.size_bytes for r in rows)
+        self.src_status.set(
+            f"source files={len(rows)}  total={format_size(total_bytes)}"
+        )
+
+    # ---- Tab 3: Process ----
+
+    def _build_tab_process(self, parent: ttk.Frame) -> None:
+        info = ttk.LabelFrame(parent, text="Source audio", padding=10)
+        info.pack(fill="x", padx=4, pady=4)
+        self._configure_cols(info)
+
+        ttk.Label(info, text="File").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        self.proc_name_var = tk.StringVar(value="(none)")
+        ttk.Label(info, textvariable=self.proc_name_var).grid(
+            row=0, column=1, columnspan=2, sticky="w", pady=4
+        )
+        ttk.Button(info, text="Play", command=self._proc_play_source).grid(
+            row=0, column=3, sticky="e", pady=4
+        )
+
+        ttk.Label(info, text="Path").grid(row=1, column=0, sticky="nw", padx=(0, 8), pady=4)
+        self.proc_path_var = tk.StringVar(value="")
+        ttk.Label(info, textvariable=self.proc_path_var, wraplength=720).grid(
+            row=1, column=1, columnspan=3, sticky="w", pady=4
+        )
+
+        ttk.Label(info, text="Size").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
+        self.proc_size_var = tk.StringVar(value="")
+        ttk.Label(info, textvariable=self.proc_size_var).grid(row=2, column=1, sticky="w", pady=4)
+
+        stems = ttk.LabelFrame(parent, text="Separated stems", padding=10)
+        stems.pack(fill="x", padx=4, pady=4)
+        self._configure_cols(stems)
+
+        self.proc_vocals_var = tk.StringVar(value="(not found)")
+        self.proc_inst_var = tk.StringVar(value="(not found)")
+        self._process_vocals_path: str | None = None
+        self._process_inst_path: str | None = None
+
+        ttk.Label(stems, text="Vocals").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Label(stems, textvariable=self.proc_vocals_var).grid(
+            row=0, column=1, sticky="ew", pady=4
+        )
+        self.proc_vocals_play = ttk.Button(
+            stems, text="Play", command=self._proc_play_vocals, state="disabled"
+        )
+        self.proc_vocals_play.grid(row=0, column=2, sticky="e", pady=4)
+
+        ttk.Label(stems, text="Instrumental").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Label(stems, textvariable=self.proc_inst_var).grid(
+            row=1, column=1, sticky="ew", pady=4
+        )
+        self.proc_inst_play = ttk.Button(
+            stems, text="Play", command=self._proc_play_inst, state="disabled"
+        )
+        self.proc_inst_play.grid(row=1, column=2, sticky="e", pady=4)
+
+        self.proc_sep_frame = ttk.Frame(parent)
+        self.proc_sep_frame.pack(fill="x", padx=4, pady=8)
+        self.proc_sep_btn = ttk.Button(
+            self.proc_sep_frame,
+            text="Separate",
+            command=self._proc_run_separate,
+            style=BTN_STYLE_SEPARATE,
+        )
+        self.proc_sep_btn.pack(side="left", padx=(0, 8))
+        self.proc_convert_btn = ttk.Button(
+            self.proc_sep_frame,
+            text="Convert",
+            command=self._proc_go_convert,
+            style=BTN_STYLE_CONVERT,
+        )
+        self.proc_convert_btn.pack(side="left")
+
+        ttk.Label(
+            parent,
+            text=(
+                "Open from Source Audio via Process. Separation uses the same MelBand model "
+                "as the Separate tab; outputs are written beside the source file."
+            ),
+            wraplength=900,
+        ).pack(anchor="w", padx=8, pady=6)
+
+    def _proc_play_source(self) -> None:
+        if self._process_source_path:
+            self._playback_play_path(self._process_source_path)
+
+    def _proc_play_vocals(self) -> None:
+        if self._process_vocals_path:
+            self._playback_play_path(self._process_vocals_path)
+
+    def _proc_play_inst(self) -> None:
+        if self._process_inst_path:
+            self._playback_play_path(self._process_inst_path)
+
+    def _resolve_stems_for_source(self, source: str) -> tuple[str | None, str | None]:
+        vocals, inst = find_separated_for_source(
+            source,
+            self._audio_scan_rows,
+            self._stem_links,
+        )
+        if upsert_stem_link(
+            self._stem_links,
+            source,
+            vocals=vocals,
+            instrumental=inst,
+        ):
+            self._persist_stem_links()
+        return vocals, inst
+
+    def _refresh_process_tab(self) -> None:
+        if not hasattr(self, "proc_name_var"):
+            return
+        src = self._process_source_path
+        if not src or not Path(src).is_file():
+            self.proc_name_var.set("(none — select Source Audio → Process)")
+            self.proc_path_var.set("")
+            self.proc_size_var.set("")
+            self.proc_vocals_var.set("(not found)")
+            self.proc_inst_var.set("(not found)")
+            self._process_vocals_path = None
+            self._process_inst_path = None
+            self.proc_vocals_play.config(state="disabled")
+            self.proc_inst_play.config(state="disabled")
+            self.proc_sep_btn.pack(side="left", padx=(0, 8))
+            self.proc_convert_btn.pack_forget()
+            if not self.proc_sep_frame.winfo_ismapped():
+                self.proc_sep_frame.pack(fill="x", padx=4, pady=8)
+            self.proc_sep_btn.config(state="disabled")
+            return
+
+        p = Path(src)
+        self.proc_name_var.set(p.name)
+        self.proc_path_var.set(str(p.resolve()))
+        self.proc_size_var.set(format_size(p.stat().st_size))
+
+        vocals, inst = self._resolve_stems_for_source(src)
+        self._process_vocals_path = vocals
+        self._process_inst_path = inst
+
+        if vocals:
+            self.proc_vocals_var.set(vocals)
+            self.proc_vocals_play.config(state="normal")
+        else:
+            self.proc_vocals_var.set("(not found)")
+            self.proc_vocals_play.config(state="disabled")
+
+        if inst:
+            self.proc_inst_var.set(inst)
+            self.proc_inst_play.config(state="normal")
+        else:
+            self.proc_inst_var.set("(not found)")
+            self.proc_inst_play.config(state="disabled")
+
+        need_sep = not vocals or not inst
+        if need_sep:
+            if not self.proc_sep_frame.winfo_ismapped():
+                self.proc_sep_frame.pack(fill="x", padx=4, pady=8)
+            self.proc_sep_btn.pack(side="left", padx=(0, 8))
+            self.proc_convert_btn.pack_forget()
+            self.proc_sep_btn.config(state="disabled" if self.running else "normal")
+        else:
+            if not self.proc_sep_frame.winfo_ismapped():
+                self.proc_sep_frame.pack(fill="x", padx=4, pady=8)
+            self.proc_sep_btn.pack_forget()
+            self.proc_convert_btn.pack(side="left")
+            self.proc_convert_btn.config(state="disabled" if self.running else "normal")
+
+    def _proc_go_convert(self) -> None:
+        vocals = self._process_vocals_path
+        inst = self._process_inst_path
+        if not vocals or not inst:
+            messagebox.showinfo("Process", "Both vocals and instrumental stems are required.")
+            return
+        if not self._process_source_path:
+            messagebox.showinfo("Process", "No source file selected.")
+            return
+        self._set_convert_context_for_source(
+            self._process_source_path,
+            vocals=vocals,
+            inst=inst,
+        )
+        self.notebook.select(TAB_CONVERT)
+
+    def _proc_run_separate(self) -> None:
+        src = self._process_source_path
+        if not src or not Path(src).is_file():
+            messagebox.showinfo("Process", "No source file selected.")
+            return
+        out = str(Path(src).parent)
+        self.run_separate(
+            inp=src,
+            out=out,
+            quiet=True,
+            fill_infer_merge=False,
+            on_success=self._refresh_process_tab,
+        )
+
+    # ---- Tab 4: Separate ----
 
     def _build_tab_separate(self, parent: ttk.Frame) -> None:
         f = ttk.LabelFrame(parent, text="Vocals + Instrumental separation", padding=10)
@@ -1875,11 +2427,13 @@ class App:
 
         ttk.Checkbutton(
             f,
-            text="After success, fill Infer+Merge (vocals → input_path, instrumental → bgm_path)",
+            text="After success, fill Convert (vocals + instrumental stems)",
             variable=self.sep_fill_infer_merge,
         ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(8, 4))
 
-        self.sep_start_btn = ttk.Button(f, text="Start Separate", command=self.run_separate)
+        self.sep_start_btn = ttk.Button(
+            f, text="Start Separate", command=self.run_separate, style=BTN_STYLE_SEPARATE
+        )
         self.sep_start_btn.grid(row=5, column=3, sticky="e", padx=(10, 0), pady=8)
 
         ttk.Label(
@@ -1919,9 +2473,17 @@ class App:
                 return c
         return None
 
-    def run_separate(self) -> None:
-        inp = self.sep_input_path.get().strip()
-        out = self.sep_output_dir.get().strip()
+    def run_separate(
+        self,
+        *,
+        inp: str | None = None,
+        out: str | None = None,
+        on_success: Callable[[], None] | None = None,
+        quiet: bool = False,
+        fill_infer_merge: bool | None = None,
+    ) -> None:
+        inp = (inp or self.sep_input_path.get()).strip()
+        out = (out or self.sep_output_dir.get()).strip()
         if not inp or not Path(inp).is_file():
             messagebox.showerror("Missing input", "Select a valid input_path.")
             return
@@ -1991,17 +2553,27 @@ class App:
             for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
                 env[key] = proxy
 
-        def on_success() -> None:
-            if self.sep_fill_infer_merge.get():
+        def on_done() -> None:
+            do_fill = (
+                fill_infer_merge
+                if fill_infer_merge is not None
+                else self.sep_fill_infer_merge.get()
+            )
+            if do_fill:
                 self._maybe_fill_infer_merge_from_sep(out)
-            messagebox.showinfo("Separate done", f"Outputs in:\n{out}")
+            if inp:
+                self._resolve_stems_for_source(inp)
+            if on_success is not None:
+                on_success()
+            elif not quiet:
+                messagebox.showinfo("Separate done", f"Outputs in:\n{out}")
 
         self._run_cmd(
             cmd,
             rvc_root=PACKAGE_DIR,
             cwd=PACKAGE_DIR,
             env=env,
-            on_success=on_success,
+            on_success=on_done,
         )
 
     def _maybe_fill_infer_merge_from_sep(self, out_dir: str) -> None:
@@ -2028,22 +2600,123 @@ class App:
         )
         if vocals is not None:
             self.im_input_path.set(str(vocals.resolve()))
-            self.log_queue.put(f"[separate] filled Infer+Merge input_path: {vocals}\n")
+            self.log_queue.put(f"[separate] filled Convert vocals: {vocals}\n")
         if instru is not None:
             self.im_bgm_path.set(str(instru.resolve()))
-            self.log_queue.put(f"[separate] filled Infer+Merge bgm_path: {instru}\n")
+            self.log_queue.put(f"[separate] filled Convert bgm_path: {instru}\n")
         self._refresh_im_auto_paths()
+        self._refresh_convert_results_list()
 
-    # ---- Tab 9: Infer + Merge ----
+    # ---- Tab 5: Convert ----
 
-    def _build_tab_infer_merge(self, parent: ttk.Frame) -> None:
+    def _build_tab_convert(self, parent: ttk.Frame) -> None:
+        source_box = ttk.LabelFrame(parent, text="Converting source audio", padding=10)
+        source_box.pack(fill="x", padx=4, pady=4)
+        self._configure_cols(source_box)
+
+        ttk.Label(source_box, text="File").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        self.conv_source_name_var = tk.StringVar(value="(not linked)")
+        ttk.Label(source_box, textvariable=self.conv_source_name_var).grid(
+            row=0, column=1, columnspan=3, sticky="w", pady=4
+        )
+        ttk.Label(source_box, text="Path").grid(row=1, column=0, sticky="nw", padx=(0, 8), pady=4)
+        self.conv_source_path_var = tk.StringVar(value="")
+        ttk.Label(source_box, textvariable=self.conv_source_path_var, wraplength=720).grid(
+            row=1, column=1, columnspan=3, sticky="w", pady=4
+        )
+        ttk.Label(source_box, text="Vocals (infer)").grid(
+            row=2, column=0, sticky="nw", padx=(0, 8), pady=4
+        )
+        self.conv_vocals_path_var = tk.StringVar(value="")
+        ttk.Label(source_box, textvariable=self.conv_vocals_path_var, wraplength=720).grid(
+            row=2, column=1, columnspan=3, sticky="w", pady=4
+        )
+        ttk.Label(source_box, text="Instrumental (merge)").grid(
+            row=3, column=0, sticky="nw", padx=(0, 8), pady=4
+        )
+        self.conv_bgm_path_var = tk.StringVar(value="")
+        ttk.Label(source_box, textvariable=self.conv_bgm_path_var, wraplength=720).grid(
+            row=3, column=1, columnspan=3, sticky="w", pady=4
+        )
+        ttk.Label(
+            source_box,
+            text="Set from Source Audio → Process → Convert. Infer uses the separated vocals stem.",
+            wraplength=720,
+        ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(4, 0))
+
+        results_box = ttk.LabelFrame(parent, text="Convert results", padding=6)
+        results_box.pack(fill="both", expand=True, padx=4, pady=4)
+        results_box.rowconfigure(1, weight=1)
+        results_box.columnconfigure(0, weight=1)
+
+        result_ctrl = ttk.Frame(results_box)
+        result_ctrl.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        self.conv_results_status = tk.StringVar(value="No source linked.")
+        ttk.Label(result_ctrl, textvariable=self.conv_results_status).pack(side="left")
+        ttk.Button(result_ctrl, text="Refresh", command=self._refresh_convert_results_list).pack(
+            side="right", padx=(8, 0)
+        )
+        ttk.Button(result_ctrl, text="Play selected", command=self._conv_play_selected).pack(
+            side="right", padx=(8, 0)
+        )
+
+        cols = ("name", "size", "path")
+        self.conv_results_tree = ttk.Treeview(
+            results_box, columns=cols, show="headings", height=8, selectmode="browse"
+        )
+        headings = {
+            "name": ("File", 220),
+            "size": ("Size", 80),
+            "path": ("Full path", 520),
+        }
+        for key, (label, width) in headings.items():
+            self.conv_results_tree.heading(key, text=label)
+            self.conv_results_tree.column(key, width=width, anchor="w", stretch=(key == "path"))
+        conv_ysb = ttk.Scrollbar(results_box, orient="vertical", command=self.conv_results_tree.yview)
+        conv_xsb = ttk.Scrollbar(results_box, orient="horizontal", command=self.conv_results_tree.xview)
+        self.conv_results_tree.configure(yscrollcommand=conv_ysb.set, xscrollcommand=conv_xsb.set)
+        self.conv_results_tree.grid(row=1, column=0, sticky="nsew")
+        conv_ysb.grid(row=1, column=1, sticky="ns")
+        conv_xsb.grid(row=2, column=0, sticky="ew")
+        self.conv_results_tree.bind("<Double-1>", lambda _e: self._conv_play_selected())
+
         infer = ttk.LabelFrame(parent, text="Long infer", padding=10)
         infer.pack(fill="x", padx=4, pady=4)
         self._configure_cols(infer)
 
-        self._row_path(infer, 0, "model (.pth)", self.im_model_path, self._browse_im_model)
-        self._row_path(infer, 1, "index (.index)", self.im_index_path, self._browse_im_index)
-        self._row_path(infer, 2, "input_path", self.im_input_path, self._browse_im_input)
+        ttk.Label(infer, text="model (.pth)").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(infer, textvariable=self.im_model_path).grid(
+            row=0, column=1, columnspan=2, sticky="ew", pady=4
+        )
+        model_btns = ttk.Frame(infer)
+        model_btns.grid(row=0, column=3, columnspan=2, sticky="e", pady=4)
+        ttk.Button(model_btns, text="Browse", command=self._browse_im_model).pack(
+            side="left", padx=2
+        )
+        ttk.Button(
+            model_btns,
+            textvariable=self.fav_model_btn_label,
+            command=self._toggle_favorite_model,
+            width=9,
+        ).pack(side="left", padx=2)
+
+        fav_row = ttk.Frame(infer)
+        fav_row.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(0, 4))
+        fav_row.columnconfigure(1, weight=1)
+        ttk.Label(fav_row, text="Favorites").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.fav_model_combo = ttk.Combobox(
+            fav_row,
+            textvariable=self.fav_model_pick,
+            state="readonly",
+            width=56,
+        )
+        self.fav_model_combo.grid(row=0, column=1, sticky="ew")
+        self.fav_model_combo.bind("<<ComboboxSelected>>", self._apply_favorite_model)
+        ttk.Button(fav_row, text="Apply favorite", command=self._apply_favorite_model).grid(
+            row=0, column=2, sticky="e", padx=(8, 0)
+        )
+
+        self._row_path(infer, 2, "index (.index)", self.im_index_path, self._browse_im_index)
         im_out_entry, im_out_btn = self._row_path(
             infer, 3, "infer_output_dir", self.im_infer_output_dir, self._browse_im_infer_out_dir
         )
@@ -2112,9 +2785,6 @@ class App:
             row=5, column=1, sticky="w", padx=4
         )
 
-        self.im_infer_btn = ttk.Button(params, text="Start Infer", command=self.run_infer_long)
-        self.im_infer_btn.grid(row=5, column=3, sticky="e", padx=(10, 0), pady=8)
-
         ttk.Label(
             params,
             text=(
@@ -2135,12 +2805,16 @@ class App:
         )
         self._row_readonly(merge, 3, "merge_output_path", self.im_merge_output_path)
 
-        self.im_merge_btn = ttk.Button(merge, text="Start Merge", command=self.run_merge)
-        self.im_merge_btn.grid(row=4, column=4, sticky="e", padx=(10, 0), pady=4)
+        actions = ttk.Frame(parent)
+        actions.pack(fill="x", padx=4, pady=8)
+        self.im_convert_btn = ttk.Button(
+            actions, text="Convert", command=self.run_convert, style=BTN_STYLE_CONVERT
+        )
+        self.im_convert_btn.pack(side="left")
 
         ttk.Label(
             parent,
-            text="Use Start Infer / Start Merge on this tab. Global Start is disabled here.",
+            text="Convert runs long infer, then merges with BGM on success. Global Start is disabled here.",
             wraplength=900,
         ).pack(anchor="w", padx=8, pady=6)
 
@@ -2151,8 +2825,108 @@ class App:
             self.im_infer_output_dir,
             self.im_infer_result,
             self.im_merge_output_dir,
+            self.im_bgm_path,
         ):
             var.trace_add("write", lambda *_a: self._refresh_im_auto_paths())
+        for var in (self.im_input_path, self.im_bgm_path):
+            var.trace_add("write", lambda *_a: self._refresh_convert_results_list())
+
+    def _ensure_convert_stem_paths(self, source: str) -> None:
+        link = self._stem_links.get(source_key(source))
+        if not link:
+            return
+        if not self.im_input_path.get().strip() and link.vocals:
+            self.im_input_path.set(link.vocals)
+        if not self.im_bgm_path.get().strip() and link.instrumental:
+            self.im_bgm_path.set(link.instrumental)
+
+    def _resolve_convert_source(self) -> str | None:
+        if self._convert_source_path and Path(self._convert_source_path).is_file():
+            return self._convert_source_path
+        vocals = self.im_input_path.get().strip()
+        if vocals:
+            src = find_source_for_vocals(vocals, self._stem_links, self._audio_scan_rows)
+            if src:
+                self._convert_source_path = src
+                return src
+        return None
+
+    def _record_convert_result(self, source: str | None, result_path: str) -> None:
+        if not source:
+            return
+        if add_convert_result(self._stem_links, source, result_path):
+            self._persist_stem_links()
+
+    def _conv_selected_path(self) -> str | None:
+        if not hasattr(self, "conv_results_tree"):
+            return None
+        sel = self.conv_results_tree.selection()
+        if not sel:
+            return None
+        vals = self.conv_results_tree.item(sel[0], "values")
+        if not vals or len(vals) < 3:
+            return None
+        path = str(vals[2]).strip()
+        return path if path and Path(path).is_file() else None
+
+    def _conv_play_selected(self) -> None:
+        path = self._conv_selected_path()
+        if not path:
+            messagebox.showinfo("Convert", "Select a convert result in the list first.")
+            return
+        self._playback_play_path(path)
+
+    def _refresh_convert_results_list(self) -> None:
+        if not hasattr(self, "conv_results_tree"):
+            return
+        for item in self.conv_results_tree.get_children():
+            self.conv_results_tree.delete(item)
+
+        source = self._resolve_convert_source()
+        if not source:
+            self.conv_source_name_var.set("(not linked)")
+            self.conv_source_path_var.set("Open Source Audio → Process → Convert")
+            self.conv_vocals_path_var.set("")
+            self.conv_bgm_path_var.set("")
+            self.conv_results_status.set("No source linked.")
+            return
+
+        self._ensure_convert_stem_paths(source)
+        p = Path(source)
+        self.conv_source_name_var.set(p.name)
+        self.conv_source_path_var.set(str(p.resolve()))
+        vocals = self.im_input_path.get().strip()
+        bgm = self.im_bgm_path.get().strip()
+        link = self._stem_links.get(source_key(source))
+        if link:
+            if not vocals and link.vocals:
+                vocals = link.vocals
+            if not bgm and link.instrumental:
+                bgm = link.instrumental
+        self.conv_vocals_path_var.set(vocals or "(not set — run Separate on Process)")
+        self.conv_bgm_path_var.set(bgm or "(not set — run Separate on Process)")
+        extra_dirs = [
+            self.im_merge_output_dir.get(),
+            self.im_infer_output_dir.get(),
+        ]
+        results = find_convert_results_for_source(
+            source,
+            self._stem_links,
+            self._audio_scan_rows,
+            extra_dirs,
+        )
+        for path_s in results:
+            rp = Path(path_s)
+            try:
+                size = format_size(rp.stat().st_size)
+            except OSError:
+                size = "?"
+            self.conv_results_tree.insert(
+                "",
+                tk.END,
+                values=(rp.name, size, str(rp.resolve())),
+            )
+        self.conv_results_status.set(f"source={p.name}  results={len(results)}")
 
     def _browse_im_model(self) -> None:
         root = self._configured_root()
@@ -2170,6 +2944,7 @@ class App:
         self.im_model_name.set(Path(path).name)
         self._autofill_im_index()
         self._refresh_im_auto_paths()
+        self._update_fav_model_btn_label()
 
     def _browse_im_index(self) -> None:
         root = self._configured_root()
@@ -2196,16 +2971,6 @@ class App:
                 return
         found = find_index_for_model(model, root)
         self.im_index_path.set(found or "")
-
-    def _browse_im_input(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Select input audio",
-            filetypes=AUDIO_FILETYPES,
-            **self._path_dialog_opts(self.im_input_path.get(), for_file=True),
-        )
-        if path:
-            self.im_input_path.set(path)
-            self._refresh_im_auto_paths()
 
     def _browse_im_infer_out_dir(self) -> None:
         if self.exp_locked:
@@ -2302,7 +3067,8 @@ class App:
             return
         self._job_pct = pct
         shown = int(round(pct))
-        self.root.title(f"{BASE_TITLE} — {shown}%")
+        # Put percent first so Windows taskbar truncation keeps it visible.
+        self.root.title(f"[{shown}%] {BASE_TITLE}")
         if self.running:
             self.status_var.set(f"Running… {shown}%")
 
@@ -2325,6 +3091,14 @@ class App:
                         return
                 except ValueError:
                     pass
+
+        m = _RE_TQDM_PCT.search(line)
+        if m:
+            try:
+                self._set_window_progress(float(m.group(1)))
+                return
+            except ValueError:
+                pass
 
         m = _RE_TRAIN_EPOCH_PCT.search(line)
         if m:
@@ -2357,8 +3131,9 @@ class App:
                 break
             self._append_log(msg)
             if self.running:
-                for line in msg.splitlines():
-                    self._parse_progress_from_line(line)
+                for line in msg.replace("\r", "\n").splitlines():
+                    if line.strip():
+                        self._parse_progress_from_line(line)
         self.root.after(80, self._drain_log_queue)
 
     def _set_running(self, running: bool) -> None:
@@ -2366,11 +3141,17 @@ class App:
         self.start_btn.config(state="disabled" if running else "normal")
         self.stop_btn.config(state="normal" if running else "disabled")
         st = "disabled" if running else "normal"
-        if hasattr(self, "im_infer_btn"):
-            self.im_infer_btn.config(state=st)
-            self.im_merge_btn.config(state=st)
+        if hasattr(self, "im_convert_btn"):
+            self.im_convert_btn.config(state=st)
         if hasattr(self, "sep_start_btn"):
             self.sep_start_btn.config(state=st)
+        if hasattr(self, "proc_sep_btn"):
+            if running:
+                self.proc_sep_btn.config(state="disabled")
+                if hasattr(self, "proc_convert_btn"):
+                    self.proc_convert_btn.config(state="disabled")
+            else:
+                self._refresh_process_tab()
         if running:
             self._set_window_progress(0.0)
             self.status_var.set("Running… 0%")
@@ -2383,14 +3164,12 @@ class App:
     def _on_tab_changed(self, _event: tk.Event | None = None) -> None:
         self._update_global_start_state()
         try:
-            idx = self.notebook.index(self.notebook.select())
+            if self.notebook.index(self.notebook.select()) == TAB_PROCESS:
+                self._refresh_process_tab()
+            elif self.notebook.index(self.notebook.select()) == TAB_CONVERT:
+                self._refresh_convert_results_list()
         except tk.TclError:
-            idx = -1
-        if idx == TAB_METRICS:
-            if not self.metrics_exp.get().strip():
-                self._metrics_use_active_exp()
-            else:
-                self._refresh_train_metrics()
+            pass
         self._save_settings()
 
     def _update_global_start_state(self) -> None:
@@ -2400,8 +3179,14 @@ class App:
             idx = self.notebook.index(self.notebook.select())
         except tk.TclError:
             return
-        # Global Start disabled on Settings, Metrics, Separate, Infer+Merge
-        if idx in (TAB_SETTINGS, TAB_METRICS, TAB_SEPARATE, TAB_INFER_MERGE):
+        if idx in (
+            TAB_SETTINGS,
+            TAB_AUDIO_SCAN,
+            TAB_SOURCE,
+            TAB_PROCESS,
+            TAB_SEPARATE,
+            TAB_CONVERT,
+        ):
             self.start_btn.config(state="disabled")
         else:
             self.start_btn.config(state="normal")
@@ -2437,7 +3222,7 @@ class App:
         self.log_queue.put("\n[stop] killing process tree…\n")
         self._kill_process()
         self.status_var.set("Stopping…")
-        self.root.title(f"{BASE_TITLE} — stopping")
+        self.root.title(f"[stopping] {BASE_TITLE}")
 
     def _run_cmd(
         self,
@@ -2448,8 +3233,11 @@ class App:
         total_epoch: int | None = None,
         cwd: Path | None = None,
         env: dict[str, str] | None = None,
+        *,
+        chain: bool = False,
+        release_running: bool = True,
     ) -> None:
-        if self.running:
+        if self.running and not chain:
             messagebox.showwarning("Busy", "Wait for the current job to finish, or Stop it.")
             return
 
@@ -2475,6 +3263,7 @@ class App:
             )
             self.log_queue.put(f"cwd: {work_cwd}\n")
             self.log_queue.put("=" * 72 + "\n")
+            success = False
             try:
                 proc = subprocess.Popen(
                     cmd,
@@ -2493,13 +3282,15 @@ class App:
                     self.log_queue.put(line)
                 code = proc.wait()
                 self.log_queue.put(f"\n[exit_code] {code}\n")
-                if code == 0 and on_success is not None:
+                success = code == 0
+                if success and on_success is not None:
                     self.root.after(0, on_success)
             except Exception as exc:
                 self.log_queue.put(f"\n[error] {exc}\n")
             finally:
                 self.proc = None
-                self.root.after(0, lambda: self._set_running(False))
+                if release_running or not success:
+                    self.root.after(0, lambda: self._set_running(False))
 
         self._reset_job_progress()
         if total_epoch is not None and total_epoch > 0:
@@ -2516,252 +3307,26 @@ class App:
         if idx == TAB_SETTINGS:
             messagebox.showinfo("Settings", "Configure RVC root here; use other tabs to run jobs.")
             return
-        if idx == TAB_METRICS:
-            self._refresh_train_metrics()
+        if idx == TAB_AUDIO_SCAN:
+            messagebox.showinfo("Audio Scan", "Use Scan on this tab (roots are saved automatically).")
+            return
+        if idx == TAB_SOURCE:
+            messagebox.showinfo("Source Audio", "Browse source files from the last Audio Scan.")
+            return
+        if idx == TAB_PROCESS:
+            messagebox.showinfo(
+                "Process",
+                "Select a source file on Source Audio and press Process, or use Separate here.",
+            )
             return
         if idx == TAB_SEPARATE:
             messagebox.showinfo("Separate", "Use Start Separate on this tab.")
             return
-        if idx == TAB_INFER_MERGE:
-            messagebox.showinfo(
-                "Infer + Merge",
-                "Use Start Infer or Start Merge on this tab.",
-            )
+        if idx == TAB_CONVERT:
+            messagebox.showinfo("Convert", "Configure model and paths, then press Convert.")
             return
-        root = self._require_rvc_root()
-        if root is None:
-            return
-        builders = {
-            TAB_PREPROCESS: self._cmd_preprocess,
-            TAB_EXTRACT_F0: self._cmd_extract_f0,
-            TAB_EXTRACT_HUBERT: self._cmd_extract_hubert,
-            TAB_TRAIN: self._cmd_train,
-            TAB_BUILD_INDEX: self._cmd_build_index,
-            TAB_INFER_AB: self._cmd_infer_ab,
-        }
-        builder = builders.get(idx)
-        if builder is None:
-            return
-        cmd = builder(root)
-        if cmd is None:
-            return
-        on_success = None
-        if idx == TAB_INFER_AB:
-            on_success = self._reload_ab_results
-        total_epoch = None
-        if idx == TAB_TRAIN:
-            try:
-                total_epoch = max(1, int(self.tr_total_epoch.get().strip() or "200"))
-            except ValueError:
-                total_epoch = 200
-        self._run_cmd(cmd, root, on_success=on_success, total_epoch=total_epoch)
 
-    def _cmd_preprocess(self, root: Path) -> list[str] | None:
-        inp = self.pp_inp_root.get().strip()
-        exp = self.pp_exp_dir.get().strip() or "logs/my_exp"
-        if not inp or not Path(inp).is_dir():
-            messagebox.showerror("Missing input", "Select a valid input audio directory.")
-            return None
-        exp_path = Path(exp)
-        if not exp_path.is_absolute():
-            exp_path = (root / exp).resolve()
-        else:
-            exp_path = exp_path.resolve()
-        py = str(rvc_python(root))
-        script = str(SCRIPTS_DIR / "preprocess_flex.py")
-        cmd = [
-            py,
-            script,
-            "--inp_root",
-            inp,
-            "--exp_dir",
-            str(exp_path),
-            "--sr",
-            self.pp_sr.get().strip(),
-            "--n_p",
-            self.pp_n_p.get().strip(),
-            "--per",
-            self.pp_per.get().strip(),
-            "--overlap",
-            self.pp_overlap.get().strip(),
-            "--highpass_hz",
-            self.pp_highpass_hz.get().strip(),
-            "--threshold",
-            self.pp_threshold.get().strip(),
-            "--min_length",
-            self.pp_min_length.get().strip(),
-            "--min_interval",
-            self.pp_min_interval.get().strip(),
-            "--hop_size",
-            self.pp_hop_size.get().strip(),
-            "--max_sil_kept",
-            self.pp_max_sil_kept.get().strip(),
-            "--norm_max",
-            self.pp_norm_max.get().strip(),
-            "--norm_alpha",
-            self.pp_norm_alpha.get().strip(),
-            "--peak_reject",
-            self.pp_peak_reject.get().strip(),
-        ]
-        if self.pp_noparallel.get():
-            cmd.append("--noparallel")
-        if not self.pp_highpass.get():
-            cmd.append("--no_highpass")
-        return cmd
-
-    def _cmd_extract_f0(self, root: Path) -> list[str] | None:
-        exp = self.exp_name(self.f0_exp.get())
-        if not exp:
-            messagebox.showerror("Missing exp", "Enter an experiment name.")
-            return None
-        py = str(rvc_python(root))
-        script = str(root / "train" / "dataset" / "extract_f0.py")
-        is_half = "True" if self.f0_is_half.get() else "False"
-        return [
-            py,
-            script,
-            "cuda",
-            "1",
-            "0",
-            self.f0_gpu.get().strip() or "0",
-            exp,
-            is_half,
-        ]
-
-    def _cmd_extract_hubert(self, root: Path) -> list[str] | None:
-        exp = self.exp_name(self.hb_exp.get())
-        if not exp:
-            messagebox.showerror("Missing exp", "Enter an experiment name.")
-            return None
-        py = str(rvc_python(root))
-        script = str(root / "train" / "dataset" / "extract_hubert_feature.py")
-        is_half = "True" if self.hb_is_half.get() else "False"
-        return [
-            py,
-            script,
-            "cuda",
-            "1",
-            "0",
-            self.hb_gpu.get().strip() or "0",
-            exp,
-            self.hb_version.get().strip() or "v2",
-            is_half,
-        ]
-
-    def _cmd_train(self, root: Path) -> list[str] | None:
-        exp = self.exp_name(self.tr_exp.get()) or "my_exp"
-        py = str(rvc_python(root))
-        script = str(SCRIPTS_DIR / "train_flex.py")
-        cmd = [
-            py,
-            script,
-            "--exp_dir",
-            f"logs/{exp}",
-            "--sample_rate",
-            self.tr_sample_rate.get().strip(),
-            "--version",
-            self.tr_version.get().strip(),
-            "--spk_id",
-            self.tr_spk_id.get().strip(),
-            "--batch_size",
-            self.tr_batch_size.get().strip(),
-            "--total_epoch",
-            self.tr_total_epoch.get().strip(),
-            "--save_every_epoch",
-            self.tr_save_every_epoch.get().strip(),
-            "--gpus",
-            self.tr_gpus.get().strip() or "0",
-        ]
-        if self.tr_if_f0.get():
-            cmd.append("--if_f0")
-        else:
-            cmd.append("--no-if_f0")
-        if self.tr_save_latest_only.get():
-            cmd.append("--save_latest_only")
-        else:
-            cmd.append("--no-save_latest_only")
-        if self.tr_cache_in_gpu.get():
-            cmd.append("--cache_in_gpu")
-        else:
-            cmd.append("--no-cache_in_gpu")
-        if self.tr_save_every_weights.get():
-            cmd.append("--save_every_weights")
-        else:
-            cmd.append("--no-save_every_weights")
-        pg = self.tr_pretrain_g.get().strip()
-        pd = self.tr_pretrain_d.get().strip()
-        if pg:
-            cmd.extend(["--pretrain_g", pg])
-        if pd:
-            cmd.extend(["--pretrain_d", pd])
-        return cmd
-
-    def _cmd_build_index(self, root: Path) -> list[str] | None:
-        exp = self.exp_name(self.ix_exp.get())
-        if not exp:
-            messagebox.showerror("Missing exp", "Enter an experiment name.")
-            return None
-        outside = self.ix_outside.get().strip() or str(root / "assets" / "indices")
-        Path(outside).mkdir(parents=True, exist_ok=True)
-        py = str(rvc_python(root))
-        script = str(root / "train" / "train_index.py")
-        return [
-            py,
-            script,
-            exp,
-            self.ix_version.get().strip() or "v2",
-            outside,
-            self.ix_n_cpu.get().strip() or "4",
-        ]
-
-    def _cmd_infer_ab(self, root: Path) -> list[str] | None:
-        inp = self.ab_input.get().strip()
-        if not inp or not Path(inp).is_file():
-            messagebox.showerror("Missing input", "Select a valid test audio file.")
-            return None
-        weights = self._selected_weights()
-        if not weights:
-            messagebox.showerror("No weights", "Refresh and check at least one .pth weight.")
-            return None
-        out_dir = self.ab_out_dir.get().strip() or str(root / "logs" / "my_exp" / "infer_ab_test")
-        Path(out_dir).mkdir(parents=True, exist_ok=True)
-        py = str(rvc_python(root))
-        script = str(SCRIPTS_DIR / "infer_batch_test.py")
-        cmd = [
-            py,
-            script,
-            "--input",
-            inp,
-            "--weights",
-            *weights,
-            "--out_dir",
-            out_dir,
-            "--spk_id",
-            self.ab_spk.get().strip() or "0",
-            "--f0_up_key",
-            self.ab_pitch.get().strip() or "0",
-            "--f0_method",
-            self.ab_f0_method.get().strip() or "rmvpe",
-            "--index_rate",
-            self.ab_index_rate.get().strip() or "0.75",
-            "--protect",
-            self.ab_protect.get().strip() or "0.33",
-            "--breath_mix_rate",
-            self.ab_breath_mix.get().strip() or "0.65",
-            "--rms_mix_rate",
-            self.ab_rms.get().strip() or "0.25",
-            "--resample_sr",
-            self.ab_resample.get().strip() or "0",
-        ]
-        index = self.ab_index.get().strip()
-        if index:
-            cmd.extend(["--index", index])
-        return cmd
-
-    def run_infer_long(self) -> None:
-        root = self._require_rvc_root()
-        if root is None:
-            return
+    def _build_infer_cmd(self, root: Path) -> tuple[list[str], str, dict[str, str]] | None:
         self._refresh_im_auto_paths()
         model_path = self.im_model_path.get().strip()
         input_path = self.im_input_path.get().strip()
@@ -2771,19 +3336,23 @@ class App:
 
         if not model_path or not Path(model_path).is_file():
             messagebox.showerror("Missing model", "Browse and select a valid .pth model.")
-            return
+            return None
         if not input_path or not Path(input_path).is_file():
-            messagebox.showerror("Missing input", "Select a valid input_path.")
-            return
+            messagebox.showerror(
+                "Missing vocals",
+                "Separated vocals not found.\n"
+                "Open Source Audio → Process, run Separate, then Convert.",
+            )
+            return None
         if not opt_path:
-            messagebox.showerror("Missing opt_path", "Set model and input_path first.")
-            return
+            messagebox.showerror("Missing opt_path", "Set model and vocals stem first.")
+            return None
         if not model_name:
             model_name = Path(model_path).name
             self.im_model_name.set(model_name)
         if index_path and not Path(index_path).is_file():
             messagebox.showerror("Missing index", f"Index file not found:\n{index_path}")
-            return
+            return None
 
         Path(opt_path).parent.mkdir(parents=True, exist_ok=True)
         py = str(rvc_python(root))
@@ -2822,40 +3391,26 @@ class App:
         ]
         if index_path:
             cmd.extend(["--index_path", index_path])
-        # filter_radius is kept in UI for harvest workflows; current VC API ignores it.
+        env_extra = {"weight_root": str(Path(model_path).parent)}
+        return cmd, opt_path, env_extra
 
-        def on_success() -> None:
-            self.im_infer_result.set(opt_path)
-            self._refresh_im_merge_output_path()
-            messagebox.showinfo("Infer done", f"Output:\n{opt_path}")
-
-        self._run_cmd(
-            cmd,
-            root,
-            on_success=on_success,
-            env_extra={"weight_root": str(Path(model_path).parent)},
-        )
-
-    def run_merge(self) -> None:
-        root = self._require_rvc_root()
-        if root is None:
-            return
+    def _build_merge_cmd(self) -> tuple[list[str], str, str] | None:
         infer_result = self.im_infer_result.get().strip()
         bgm_path = self.im_bgm_path.get().strip()
         merge_out = self.im_merge_output_path.get().strip()
 
         if not infer_result or not Path(infer_result).is_file():
-            messagebox.showerror("Missing result", "Select a valid infer result file.")
-            return
+            messagebox.showerror("Missing result", "Infer output not found for merge.")
+            return None
         if not bgm_path or not Path(bgm_path).is_file():
             messagebox.showerror("Missing BGM", "Select a valid background audio file.")
-            return
+            return None
         if not self.im_merge_output_dir.get().strip():
             messagebox.showerror("Missing output", "Select a valid merge_output_dir.")
-            return
+            return None
         if not merge_out:
             messagebox.showerror("Missing output", "merge_output_path is empty.")
-            return
+            return None
 
         Path(merge_out).parent.mkdir(parents=True, exist_ok=True)
         ext = Path(merge_out).suffix.lower()
@@ -2884,26 +3439,71 @@ class App:
             *codec_args,
             merge_out,
         ]
+        return cmd, infer_result, merge_out
 
-        def on_success() -> None:
-            note = ""
-            try:
-                infer_path = Path(infer_result)
-                merge_path = Path(merge_out)
-                if (
-                    infer_path.is_file()
-                    and merge_path.is_file()
-                    and infer_path.resolve() != merge_path.resolve()
-                ):
-                    infer_path.unlink()
-                    note = f"\n\nDeleted infer result:\n{infer_result}"
-                    self.log_queue.put(f"[merge] deleted infer result: {infer_result}\n")
-            except OSError as exc:
-                note = f"\n\nCould not delete infer result:\n{exc}"
-                self.log_queue.put(f"[merge] delete infer result failed: {exc}\n")
-            messagebox.showinfo("Merge done", f"Output:\n{merge_out}{note}")
+    def run_convert(self) -> None:
+        root = self._require_rvc_root()
+        if root is None:
+            return
+        built = self._build_infer_cmd(root)
+        if built is None:
+            return
+        infer_cmd, opt_path, env_extra = built
+        convert_source = self._resolve_convert_source()
 
-        self._run_cmd(cmd, root, on_success=on_success)
+        bgm_path = self.im_bgm_path.get().strip()
+        if not bgm_path or not Path(bgm_path).is_file():
+            messagebox.showerror("Missing BGM", "Select a valid background audio file.")
+            return
+        if not self.im_merge_output_dir.get().strip():
+            messagebox.showerror("Missing output", "Select a valid merge_output_dir.")
+            return
+        self._refresh_im_merge_output_path()
+        if not self.im_merge_output_path.get().strip():
+            messagebox.showerror("Missing output", "merge_output_path is empty.")
+            return
+
+        def after_infer() -> None:
+            self.im_infer_result.set(opt_path)
+            self._refresh_im_merge_output_path()
+            merge_built = self._build_merge_cmd()
+            if merge_built is None:
+                messagebox.showerror(
+                    "Convert",
+                    f"Infer finished but merge could not start.\nOutput:\n{opt_path}",
+                )
+                return
+            merge_cmd, infer_result, merge_out = merge_built
+
+            def after_merge() -> None:
+                note = ""
+                try:
+                    infer_path = Path(infer_result)
+                    merge_path = Path(merge_out)
+                    if (
+                        infer_path.is_file()
+                        and merge_path.is_file()
+                        and infer_path.resolve() != merge_path.resolve()
+                    ):
+                        infer_path.unlink()
+                        note = f"\n\nDeleted intermediate infer result:\n{infer_result}"
+                        self.log_queue.put(f"[convert] deleted infer result: {infer_result}\n")
+                except OSError as exc:
+                    note = f"\n\nCould not delete infer result:\n{exc}"
+                    self.log_queue.put(f"[convert] delete infer result failed: {exc}\n")
+                self._record_convert_result(convert_source, merge_out)
+                self._refresh_convert_results_list()
+                messagebox.showinfo("Convert done", f"Output:\n{merge_out}{note}")
+
+            self._run_cmd(merge_cmd, root, on_success=after_merge, chain=True)
+
+        self._run_cmd(
+            infer_cmd,
+            root,
+            on_success=after_infer,
+            env_extra=env_extra,
+            release_running=False,
+        )
 
 
 # ---------------------------------------------------------------------------

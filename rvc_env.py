@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 PACKAGE_DIR = Path(__file__).resolve().parent
-SETTINGS_PATH = PACKAGE_DIR / "settings.json"
+DB_PATH = PACKAGE_DIR / "rvc_gui.db"
 SCRIPTS_DIR = PACKAGE_DIR / "scripts"
 
 

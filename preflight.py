@@ -13,4 +13,17 @@ if str(HERE) not in sys.path:
 import gui  # noqa: F401
 import rvc_env  # noqa: F401
 
+missing: list[str] = []
+for mod, pip_name in (("pygame", "pygame"), ("soundfile", "soundfile")):
+    try:
+        __import__(mod)
+    except ImportError:
+        missing.append(pip_name)
+if missing:
+    print(
+        "warning: optional playback deps missing — install with:\n"
+        f"  python -m pip install {' '.join(missing)}",
+        flush=True,
+    )
+
 print("preflight ok", flush=True)
