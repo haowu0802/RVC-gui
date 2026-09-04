@@ -17,6 +17,23 @@ from source_match import find_separated_for_source, stem_key  # noqa: E402
 def test_stem_key_source_and_vocals() -> None:
     assert stem_key("song.mp3") == stem_key("song_(vocals)_vocals_mel_band_roformer.flac")
     assert stem_key("song.mp3") == stem_key("song_(other)_vocals_mel_band_roformer.flac")
+    # Separator drops a leading underscore from the source basename
+    assert stem_key("_song.mp3") == stem_key("song_(vocals)_vocals_mel_band_roformer.flac")
+    assert stem_key("_song.mp3") == stem_key("song_(other)_vocals_mel_band_roformer.flac")
+
+
+def test_find_leading_underscore_source() -> None:
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        source = root / "_song.mp3"
+        vocals = root / "song_(vocals)_vocals_mel_band_roformer.flac"
+        inst = root / "song_(other)_vocals_mel_band_roformer.flac"
+        source.write_bytes(b"a")
+        vocals.write_bytes(b"b")
+        inst.write_bytes(b"c")
+        v, i = find_separated_for_source(str(source), rows=None)
+        assert v is not None and "(vocals)" in v
+        assert i is not None and "(other)" in i
 
 
 def test_find_from_scan_rows() -> None:

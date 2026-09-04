@@ -22,11 +22,16 @@ _STEM_SUFFIXES = (
 
 
 def stem_key(name: str) -> str:
-    """Normalize filename to a clip identity stem."""
+    """Normalize filename to a clip identity stem.
+
+    Leading underscores are stripped because audio-separator drops them when
+    writing ``_(vocals)_…`` / ``_(other)_…`` beside a source named ``_foo.mp3``.
+    """
     stem = Path(name).stem
     stem = re.sub(r"^1_", "", stem)
     for pat in _STEM_SUFFIXES:
         stem = re.sub(pat, "", stem, flags=re.I)
+    stem = stem.lstrip("_")
     return stem.lower()
 
 

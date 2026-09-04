@@ -11,7 +11,7 @@ from typing import Any, Iterator
 from rvc_env import PACKAGE_DIR
 
 DB_PATH = PACKAGE_DIR / "rvc_gui.db"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 
 _LEGACY_SETTINGS = PACKAGE_DIR / "settings.json"
 _LEGACY_STEM_LINKS = PACKAGE_DIR / "stem_links.json"
@@ -116,6 +116,7 @@ def schema_version(conn: sqlite3.Connection) -> int:
 
 def init_db(conn: sqlite3.Connection, db_path: Path | None = None) -> None:
     conn.executescript(_SCHEMA_SQL)
+    _migrate_schema(conn)
     if schema_version(conn) < SCHEMA_VERSION:
         conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
@@ -123,6 +124,20 @@ def init_db(conn: sqlite3.Connection, db_path: Path | None = None) -> None:
         )
         conn.commit()
     migrate_legacy_json(conn, db_path)
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(audio_scan_row)")}
+    if "duration_sec" not in cols:
+        conn.execute(
+            "ALTER TABLE audio_scan_row ADD COLUMN duration_sec REAL NOT NULL DEFAULT 0"
+        )
+        conn.commit()
+    ver = schema_version(conn)
+    if ver < 3:
+        conn.execute("UPDATE audio_scan_row SET kind = 'result' WHERE kind = 'clone'")
+        conn.execute("UPDATE audio_scan_row SET kind = 'other' WHERE kind = 'dfn3'")
+        conn.commit()
 
 
 def _json_load(raw: str | None, default: Any = None) -> Any:
@@ -284,6 +299,7 @@ def load_scan_cache_db(conn: sqlite3.Connection) -> list[Any]:
                 "mtime_ns": row["mtime_ns"],
                 "ctime_ns": row["ctime_ns"],
                 "kind": row["kind"],
+                "duration_sec": row["duration_sec"] if "duration_sec" in row.keys() else 0.0,
             }
         )
         if item is not None:
@@ -303,8 +319,9 @@ def save_scan_cache_db(conn: sqlite3.Connection, rows: list[Any]) -> None:
             conn.execute(
                 """
                 INSERT INTO audio_scan_row(
-                    path, root, rel_path, name, size_bytes, mtime_ns, ctime_ns, kind
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    path, root, rel_path, name, size_bytes, mtime_ns, ctime_ns, kind,
+                    duration_sec
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     d["path"],
@@ -315,6 +332,7 @@ def save_scan_cache_db(conn: sqlite3.Connection, rows: list[Any]) -> None:
                     d["mtime_ns"],
                     d["ctime_ns"],
                     d["kind"],
+                    d["duration_sec"],
                 ),
             )
 

@@ -188,6 +188,10 @@ def build_train_cmd(args: argparse.Namespace, exp_name: str) -> list[str]:
         str(args.total_epoch),
         "-se",
         str(args.save_every_epoch),
+        "-ts",
+        str(args.total_steps),
+        "-ss",
+        str(args.save_every_steps),
         "-l",
         "1" if args.save_latest_only else "0",
         "-c",
@@ -218,6 +222,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--batch_size", type=int, default=6)
     p.add_argument("--total_epoch", type=int, default=200)
     p.add_argument("--save_every_epoch", type=int, default=5)
+    p.add_argument(
+        "--total_steps",
+        type=int,
+        default=0,
+        help="Stop after N global steps (0=off; whichever of steps/epochs hits first)",
+    )
+    p.add_argument(
+        "--save_every_steps",
+        type=int,
+        default=0,
+        help="Export assets/weights every N steps (0=off)",
+    )
     p.add_argument("--gpus", type=str, default="0", help="GPU ids, e.g. 0 or 0-1")
     p.add_argument(
         "--pretrain_g",

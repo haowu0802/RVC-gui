@@ -28,6 +28,7 @@ def test_scan_cache_roundtrip() -> None:
             mtime_ns=99,
             ctime_ns=88,
             kind=KIND_SOURCE,
+            duration_sec=42.5,
         )
     ]
     with tempfile.TemporaryDirectory() as tmp:
@@ -37,3 +38,4 @@ def test_scan_cache_roundtrip() -> None:
         assert len(loaded) == 1
         assert loaded[0].name == "song.wav"
         assert loaded[0].kind == KIND_SOURCE
+        assert loaded[0].duration_sec == 42.5

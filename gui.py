@@ -9,6 +9,7 @@ import queue
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -20,7 +21,7 @@ _PACKAGE_DIR = Path(__file__).resolve().parent
 if str(_PACKAGE_DIR) not in sys.path:
     sys.path.insert(0, str(_PACKAGE_DIR))
 
-from audio_kind import KIND_FILTER_VALUES
+from audio_kind import KIND_EDIT_VALUES, KIND_FILTER_VALUES, kind_from_label, kind_label
 from playback import (
     AudioPlayer,
     PlaybackError,
@@ -49,15 +50,21 @@ from stem_links import (
 from audio_scan import (
     AudioFileRow,
     SRC_SORT_LABELS,
+    apply_duration_updates,
     count_by_kind,
     filter_rows,
+    format_duration,
     format_size,
     load_scan_cache,
+    merge_rescan_rows,
+    paths_needing_duration,
+    probe_duration_sec,
     save_scan_cache,
     scan_audio_roots,
     sort_key_from_label,
     sort_label,
     sort_rows,
+    update_row_kind,
 )
 from rvc_env import (
     PACKAGE_DIR,
@@ -92,12 +99,11 @@ TAB_NAMES = [
     "Convert",
 ]
 
-SRC_TREE_COLUMNS = ("root", "rel", "name", "size", "note", "converted", "path")
+SRC_TREE_COLUMNS = ("name", "size", "duration", "note", "converted", "path")
 SRC_TREE_COL_DEFAULTS: dict[str, int] = {
-    "root": 100,
-    "rel": 220,
-    "name": 160,
+    "name": 200,
     "size": 70,
+    "duration": 72,
     "note": 180,
     "converted": 56,
     "path": 360,
@@ -111,6 +117,24 @@ DEFAULT_SEP_MODEL_DIR = PACKAGE_DIR / "models"
 DEFAULT_SEP_VENV = PACKAGE_DIR / ".venv"
 
 BASE_TITLE = "RVC Pipeline"
+
+
+def reveal_path_in_file_manager(path: Path | str) -> None:
+    target = Path(path).expanduser()
+    try:
+        target = target.resolve()
+    except OSError:
+        pass
+    if not target.exists():
+        raise FileNotFoundError(target)
+    if sys.platform == "win32":
+        subprocess.run(["explorer", "/select,", str(target)], check=False)
+        return
+    if sys.platform == "darwin":
+        subprocess.run(["open", "-R", str(target)], check=False)
+        return
+    folder = target if target.is_dir() else target.parent
+    subprocess.run(["xdg-open", str(folder)], check=False)
 
 # Progress lines emitted by our scripts / RVC train & extract helpers.
 _RE_PROGRESS_FRAC = re.compile(
@@ -434,6 +458,8 @@ class App:
         # --- audio scan ---
         self.as_filter = tk.StringVar(value="")
         self.as_kind_filter = tk.StringVar(value="all")
+        self.as_sort_label = tk.StringVar(value=sort_label("rel_path"))
+        self.as_sort_desc = tk.BooleanVar(value=False)
         self.src_filter = tk.StringVar(value="")
         self.src_sort_label = tk.StringVar(value=sort_label("rel_path"))
         self.src_sort_desc = tk.BooleanVar(value=False)
@@ -447,20 +473,27 @@ class App:
         self._src_note_edit_path: str | None = None
         self._src_note_committing = False
         self._src_tree_col_widths: dict[str, int] = {}
+        self._src_colwidth_save_after_id: str | None = None
+        self._src_context_reveal_path: str | None = None
         self._db = connect()
         self._stem_links = load_stem_links(self._db)
         self._audio_scan_revision = 0
         self._stem_links_revision = 0
         self._src_display_cache_key: tuple[object, ...] | None = None
         self._src_display_cache_payload: list[tuple[AudioFileRow, str, int]] | None = None
+        self._duration_backfill_running = False
+        self._as_kind_editor: ttk.Combobox | None = None
+        self._as_kind_edit_item: str | None = None
+        self._as_kind_edit_path: str | None = None
+        self._as_kind_committing = False
+        self._convert_infer_temp: str | None = None
+        self._log_collapsed = True
 
         # --- infer + merge ---
         self.im_model_path = tk.StringVar(value="")
         self.im_model_name = tk.StringVar(value="")
         self.im_index_path = tk.StringVar(value="")
         self.im_input_path = tk.StringVar(value="")
-        self.im_infer_output_dir = tk.StringVar(value="")
-        self.im_opt_path = tk.StringVar(value="")
         self.im_f0up_key = tk.StringVar(value="0")
         self.im_f0method = tk.StringVar(value="rmvpe")
         self.im_index_rate = tk.StringVar(value="0.95")
@@ -472,8 +505,6 @@ class App:
         self.im_chunk_sec = tk.StringVar(value="200")
         self.im_overlap_sec = tk.StringVar(value="0.3")
         self.im_spk_id = tk.StringVar(value="0")
-        self.im_infer_result = tk.StringVar(value="")
-        self.im_bgm_path = tk.StringVar(value="")
         self.im_merge_output_dir = tk.StringVar(value="")
         self.im_merge_output_path = tk.StringVar(value="")
 
@@ -594,16 +625,39 @@ class App:
         return self._rvc_path("logs", name)
 
     def _fill_empty_defaults_from_root(self) -> None:
-        root = self._configured_root()
-        if root is None:
-            try:
-                root = resolve_rvc_root(self.rvc_root.get().strip() or None)
-            except FileNotFoundError:
-                return
-        if self.exp_locked:
-            return
-        if not self.im_infer_output_dir.get().strip():
-            self.im_infer_output_dir.set(str(root / "logs" / "my_exp" / "infer_long"))
+        pass
+
+    def _convert_tmp_dir(self) -> Path:
+        d = PACKAGE_DIR / ".convert_tmp"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _allocate_infer_temp_path(self, model_path: str, input_path: str) -> Path:
+        model_stem = Path(model_path).stem
+        input_stem = Path(input_path).stem
+        fd, path = tempfile.mkstemp(
+            suffix=".wav",
+            prefix=f"infer_{model_stem}_{input_stem}_",
+            dir=str(self._convert_tmp_dir()),
+        )
+        os.close(fd)
+        return Path(path)
+
+    def _merged_output_basename(self) -> str:
+        input_path = self.im_input_path.get().strip()
+        model_name = self.im_model_name.get().strip()
+        if not input_path:
+            return ""
+        src_name = Path(input_path).name
+        if "(Vocals)" in src_name:
+            return src_name.replace("(Vocals)", "(Merged)")
+        model_stem = Path(model_name).stem if model_name else Path(
+            self.im_model_path.get()
+        ).stem
+        input_stem = Path(input_path).stem
+        stem = f"{model_stem}_{input_stem}" if model_stem else input_stem
+        suffix = Path(src_name).suffix or ".wav"
+        return f"{stem}(Merged){suffix}"
 
     def _register_exp_lock_widgets(self, *widgets: tk.Widget) -> None:
         for w in widgets:
@@ -670,7 +724,6 @@ class App:
         self._suppress_autosave = True
         try:
             self.active_exp_path.set(str(p))
-            self.im_infer_output_dir.set(str(p / "infer_long"))
             self._refresh_im_auto_paths()
             self.exp_locked = bool(lock)
             self._set_exp_widgets_locked(self.exp_locked)
@@ -907,6 +960,8 @@ class App:
             "audio_scan_roots": list(self.audio_scan_roots),
             "as_filter": self.as_filter.get(),
             "as_kind_filter": self.as_kind_filter.get(),
+            "as_sort_by": sort_key_from_label(self.as_sort_label.get()),
+            "as_sort_desc": bool(self.as_sort_desc.get()),
             "src_filter": self.src_filter.get(),
             "src_sort_by": sort_key_from_label(self.src_sort_label.get()),
             "src_sort_desc": bool(self.src_sort_desc.get()),
@@ -916,7 +971,6 @@ class App:
             "im_model_name": self.im_model_name.get(),
             "im_index_path": self.im_index_path.get(),
             "im_input_path": self.im_input_path.get(),
-            "im_infer_output_dir": self.im_infer_output_dir.get(),
             "im_f0up_key": self.im_f0up_key.get(),
             "im_f0method": self.im_f0method.get(),
             "im_index_rate": self.im_index_rate.get(),
@@ -928,8 +982,6 @@ class App:
             "im_chunk_sec": self.im_chunk_sec.get(),
             "im_overlap_sec": self.im_overlap_sec.get(),
             "im_spk_id": self.im_spk_id.get(),
-            "im_infer_result": self.im_infer_result.get(),
-            "im_bgm_path": self.im_bgm_path.get(),
             "im_merge_output_dir": self.im_merge_output_dir.get(),
             "sep_input_path": self.sep_input_path.get(),
             "sep_output_dir": self.sep_output_dir.get(),
@@ -957,7 +1009,6 @@ class App:
             "im_model_name": self.im_model_name,
             "im_index_path": self.im_index_path,
             "im_input_path": self.im_input_path,
-            "im_infer_output_dir": self.im_infer_output_dir,
             "im_f0up_key": self.im_f0up_key,
             "im_f0method": self.im_f0method,
             "im_index_rate": self.im_index_rate,
@@ -969,8 +1020,6 @@ class App:
             "im_chunk_sec": self.im_chunk_sec,
             "im_overlap_sec": self.im_overlap_sec,
             "im_spk_id": self.im_spk_id,
-            "im_infer_result": self.im_infer_result,
-            "im_bgm_path": self.im_bgm_path,
             "im_merge_output_dir": self.im_merge_output_dir,
             "sep_input_path": self.sep_input_path,
             "sep_output_dir": self.sep_output_dir,
@@ -1002,6 +1051,10 @@ class App:
         self.src_sort_label.set(sort_label(sort_by))
         if "src_sort_desc" in data:
             self.src_sort_desc.set(bool(data["src_sort_desc"]))
+        as_sort_by = str(data.get("as_sort_by", "rel_path"))
+        self.as_sort_label.set(sort_label(as_sort_by))
+        if "as_sort_desc" in data:
+            self.as_sort_desc.set(bool(data["as_sort_desc"]))
 
         geo = data.get("geometry")
         if isinstance(geo, str) and geo:
@@ -1089,7 +1142,6 @@ class App:
             self.im_model_name,
             self.im_index_path,
             self.im_input_path,
-            self.im_infer_output_dir,
             self.im_f0up_key,
             self.im_f0method,
             self.im_index_rate,
@@ -1101,8 +1153,6 @@ class App:
             self.im_chunk_sec,
             self.im_overlap_sec,
             self.im_spk_id,
-            self.im_infer_result,
-            self.im_bgm_path,
             self.im_merge_output_dir,
             self.sep_input_path,
             self.sep_output_dir,
@@ -1137,6 +1187,52 @@ class App:
         outer = ttk.Frame(self.root, padding=8)
         outer.pack(fill="both", expand=True)
 
+        self._bottom_dock = ttk.Frame(outer)
+        self._bottom_dock.pack(side="bottom", fill="x")
+
+        self._build_global_playback(self._bottom_dock)
+
+        ctrl = ttk.Frame(self._bottom_dock)
+        ctrl.pack(fill="x", pady=(8, 0))
+
+        self.start_btn = ttk.Button(ctrl, text="Start", command=self.start_current_tab)
+        self.start_btn.pack(side="left")
+        self.stop_btn = ttk.Button(ctrl, text="Stop", command=self.stop_job, state="disabled")
+        self.stop_btn.pack(side="left", padx=(8, 0))
+        ttk.Label(ctrl, textvariable=self.status_var).pack(side="left", padx=(16, 0))
+
+        self._log_section = ttk.Frame(self._bottom_dock)
+        self._log_section.pack(fill="x", pady=(8, 0))
+
+        log_hdr = ttk.Frame(self._log_section)
+        log_hdr.pack(fill="x")
+        self._log_toggle_label = tk.StringVar(value="▶ Log")
+        ttk.Button(
+            log_hdr,
+            textvariable=self._log_toggle_label,
+            command=self._toggle_log_panel,
+            width=12,
+        ).pack(side="left")
+
+        self._log_body = ttk.Frame(self._log_section)
+        log_inner = ttk.Frame(self._log_body, padding=4, relief="groove", borderwidth=1)
+        log_inner.pack(fill="x")
+        self.log_text = tk.Text(
+            log_inner,
+            height=12,
+            wrap="word",
+            bg=self.colors["log_bg"],
+            fg=self.colors["log_fg"],
+            insertbackground=self.colors["log_fg"],
+            relief="flat",
+            bd=0,
+        )
+        log_sb = ttk.Scrollbar(log_inner, orient="vertical", command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=log_sb.set)
+        self.log_text.pack(side="left", fill="both", expand=True)
+        log_sb.pack(side="right", fill="y")
+        self.log_text.configure(state="disabled")
+
         self.notebook = ttk.Notebook(outer)
         self.notebook.pack(fill="both", expand=True)
 
@@ -1155,35 +1251,14 @@ class App:
             self._tab_frames.append(sf)
             builder(sf.inner)
 
-        self._build_global_playback(outer)
-
-        # Global controls
-        ctrl = ttk.Frame(outer)
-        ctrl.pack(fill="x", pady=(8, 0))
-
-        self.start_btn = ttk.Button(ctrl, text="Start", command=self.start_current_tab)
-        self.start_btn.pack(side="left")
-        self.stop_btn = ttk.Button(ctrl, text="Stop", command=self.stop_job, state="disabled")
-        self.stop_btn.pack(side="left", padx=(8, 0))
-        ttk.Label(ctrl, textvariable=self.status_var).pack(side="left", padx=(16, 0))
-
-        log_frame = ttk.LabelFrame(outer, text="Log", padding=6)
-        log_frame.pack(fill="both", expand=True, pady=(8, 0))
-        self.log_text = tk.Text(
-            log_frame,
-            height=12,
-            wrap="word",
-            bg=self.colors["log_bg"],
-            fg=self.colors["log_fg"],
-            insertbackground=self.colors["log_fg"],
-            relief="flat",
-            bd=0,
-        )
-        log_sb = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=log_sb.set)
-        self.log_text.pack(side="left", fill="both", expand=True)
-        log_sb.pack(side="right", fill="y")
-        self.log_text.configure(state="disabled")
+    def _toggle_log_panel(self) -> None:
+        self._log_collapsed = not self._log_collapsed
+        if self._log_collapsed:
+            self._log_body.pack_forget()
+            self._log_toggle_label.set("▶ Log")
+        else:
+            self._log_body.pack(fill="x")
+            self._log_toggle_label.set("▼ Log")
 
     def _row_path(
         self,
@@ -1670,34 +1745,54 @@ class App:
             textvariable=self.as_kind_filter,
             values=KIND_FILTER_VALUES,
             state="readonly",
-            width=10,
+            width=14,
         ).grid(row=0, column=3, sticky="w")
         ttk.Button(filt, text="Apply", command=self._as_apply_filter).grid(
             row=0, column=4, padx=(8, 0)
         )
 
+        sort_row = ttk.Frame(roots_frame)
+        sort_row.grid(row=3, column=0, columnspan=5, sticky="ew", pady=(8, 0))
+        ttk.Label(sort_row, text="Sort by").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.as_sort_combo = ttk.Combobox(
+            sort_row,
+            textvariable=self.as_sort_label,
+            values=list(SRC_SORT_LABELS.values()),
+            state="readonly",
+            width=18,
+        )
+        self.as_sort_combo.grid(row=0, column=1, sticky="w")
+        self.as_sort_combo.bind("<<ComboboxSelected>>", self._on_as_sort_changed)
+        ttk.Checkbutton(
+            sort_row,
+            text="Descending",
+            variable=self.as_sort_desc,
+            command=self._on_as_sort_changed,
+        ).grid(row=0, column=2, padx=(12, 0), sticky="w")
+
         self.as_status = tk.StringVar(value="No scan yet.")
         ttk.Label(roots_frame, textvariable=self.as_status).grid(
-            row=3, column=0, columnspan=5, sticky="w", pady=(8, 0)
+            row=4, column=0, columnspan=5, sticky="w", pady=(8, 0)
         )
 
         table = ttk.LabelFrame(parent, text="Audio files", padding=6)
         table.pack(fill="both", expand=True, padx=4, pady=4)
-        cols = ("kind", "root", "rel", "name", "size", "path")
+        cols = ("kind", "root", "rel", "name", "size", "duration", "path")
         self.as_tree = ttk.Treeview(
             table, columns=cols, show="headings", height=18, selectmode="browse"
         )
         headings = {
-            "kind": ("Kind", 70),
+            "kind": ("Kind", 108),
             "root": ("Root", 120),
-            "rel": ("Relative path", 260),
+            "rel": ("Relative path", 220),
             "name": ("File", 160),
-            "size": ("Size", 80),
-            "path": ("Full path", 400),
+            "size": ("Size", 72),
+            "duration": ("Duration", 72),
+            "path": ("Full path", 360),
         }
         for key, (label, width) in headings.items():
             self.as_tree.heading(key, text=label)
-            anchor = "w"
+            anchor = "center" if key in ("kind", "duration") else "w"
             self.as_tree.column(key, width=width, anchor=anchor, stretch=(key == "path"))
         ysb = ttk.Scrollbar(table, orient="vertical", command=self.as_tree.yview)
         xsb = ttk.Scrollbar(table, orient="horizontal", command=self.as_tree.xview)
@@ -1721,12 +1816,173 @@ class App:
         except tk.TclError:
             pass
 
+        self.as_tree.bind("<Button-1>", self._as_on_tree_click, add="+")
+
+    def _as_kind_column_id(self) -> str:
+        return "#1"
+
+    def _as_path_from_item(self, item: str) -> str | None:
+        vals = self.as_tree.item(item, "values")
+        if not vals or len(vals) < 7:
+            return None
+        path = str(vals[6]).strip()
+        if not path or not Path(path).is_file():
+            return None
+        return path
+
+    def _as_row_for_path(self, path: str) -> AudioFileRow | None:
+        from audio_scan import _path_key
+
+        target = _path_key(path)
+        for row in self._audio_scan_rows:
+            if _path_key(row.path) == target:
+                return row
+        return None
+
+    def _as_destroy_kind_editor(self) -> None:
+        if self._as_kind_editor is not None:
+            try:
+                self._as_kind_editor.destroy()
+            except tk.TclError:
+                pass
+        self._as_kind_editor = None
+        self._as_kind_edit_item = None
+        self._as_kind_edit_path = None
+
+    def _as_on_tree_click(self, event: tk.Event) -> None:
+        if self.as_tree.identify_region(event.x, event.y) != "cell":
+            return
+        if self.as_tree.identify_column(event.x) != self._as_kind_column_id():
+            return
+        item = self.as_tree.identify_row(event.y)
+        if item:
+            self.root.after_idle(lambda i=item: self._as_begin_kind_edit(i))
+
+    def _as_begin_kind_edit(self, item: str) -> None:
+        if not item:
+            return
+        path = self._as_path_from_item(item)
+        if not path:
+            return
+        row = self._as_row_for_path(path)
+        if row is None:
+            return
+        self._as_destroy_kind_editor()
+        bbox = self.as_tree.bbox(item, column="kind")
+        if not bbox:
+            return
+        x, y, w, h = bbox
+        combo = ttk.Combobox(
+            self.as_tree,
+            values=KIND_EDIT_VALUES,
+            state="readonly",
+            width=max(12, w // 8),
+        )
+        combo.set(row.kind_label)
+        combo.place(x=x, y=y, width=max(w, 100), height=h)
+        combo.focus_set()
+        self._as_kind_editor = combo
+        self._as_kind_edit_item = item
+        self._as_kind_edit_path = path
+        combo.bind("<<ComboboxSelected>>", self._as_commit_kind_edit)
+        combo.bind("<FocusOut>", self._as_commit_kind_edit)
+        combo.bind("<Escape>", self._as_cancel_kind_edit)
+
+    def _as_commit_kind_edit(self, _event: tk.Event | None = None) -> None:
+        if self._as_kind_committing:
+            return
+        editor = self._as_kind_editor
+        item = self._as_kind_edit_item
+        path = self._as_kind_edit_path
+        if editor is None or not item or not path:
+            self._as_destroy_kind_editor()
+            return
+        label = editor.get().strip()
+        new_kind = kind_from_label(label)
+        row = self._as_row_for_path(path)
+        if row is None or row.kind == new_kind:
+            self._as_destroy_kind_editor()
+            return
+        self._as_kind_committing = True
+        try:
+            self._audio_scan_rows = update_row_kind(self._audio_scan_rows, path, new_kind)
+            self._audio_scan_revision += 1
+            self._invalidate_source_display_cache()
+            try:
+                save_scan_cache(self._db, self._audio_scan_rows)
+            except OSError:
+                pass
+            vals = list(self.as_tree.item(item, "values"))
+            if vals:
+                vals[0] = kind_label(new_kind)
+                self.as_tree.item(item, values=vals)
+            self._refresh_source_list()
+        finally:
+            self._as_destroy_kind_editor()
+            self._as_kind_committing = False
+
+    def _as_cancel_kind_edit(self, _event: tk.Event | None = None) -> None:
+        self._as_destroy_kind_editor()
+
     def _restore_audio_scan_from_settings(self) -> None:
         self._as_refresh_roots_list()
         self._audio_scan_rows = load_scan_cache(self._db)
         if self._audio_scan_rows:
             self._as_apply_filter()
             self._refresh_source_list()
+            self._start_duration_backfill()
+
+    def _start_duration_backfill(self, paths: list[str] | None = None) -> None:
+        if self._duration_backfill_running:
+            return
+        if paths is None:
+            paths = paths_needing_duration(self._audio_scan_rows)
+        if not paths:
+            return
+        self._duration_backfill_running = True
+        total = len(paths)
+        if hasattr(self, "src_status"):
+            self.src_status.set(f"Loading durations… 0/{total}")
+
+        def worker() -> None:
+            done = 0
+            batch: dict[str, float] = {}
+            for path in paths:
+                dur = probe_duration_sec(path)
+                if dur > 0:
+                    batch[path] = dur
+                done += 1
+                if done % 25 == 0 or done == total:
+                    chunk = dict(batch)
+                    n = done
+                    self.root.after(
+                        0, lambda c=chunk, n=n: self._duration_backfill_progress(c, n, total)
+                    )
+            self.root.after(0, self._duration_backfill_done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _duration_backfill_progress(
+        self, updates: dict[str, float], done: int, total: int
+    ) -> None:
+        if not updates:
+            if hasattr(self, "src_status"):
+                self.src_status.set(f"Loading durations… {done}/{total}")
+            return
+        self._audio_scan_rows = apply_duration_updates(self._audio_scan_rows, updates)
+        self._audio_scan_revision += 1
+        self._invalidate_source_display_cache()
+        self._refresh_source_list(sort_only=True)
+        if hasattr(self, "src_status"):
+            self.src_status.set(f"Loading durations… {done}/{total}")
+
+    def _duration_backfill_done(self) -> None:
+        self._duration_backfill_running = False
+        try:
+            save_scan_cache(self._db, self._audio_scan_rows)
+        except OSError:
+            pass
+        self._refresh_source_list()
 
     def _set_audio_scan_rows(self, rows: list[AudioFileRow]) -> None:
         self._audio_scan_rows = rows
@@ -1795,23 +2051,37 @@ class App:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _on_as_sort_changed(self, _event: tk.Event | None = None) -> None:
+        self._as_apply_filter()
+        self._save_settings()
+
     def _as_scan_failed(self, msg: str) -> None:
         self._audio_scan_running = False
         self.as_status.set(f"Scan failed: {msg}")
 
     def _as_scan_done(self, rows: list[AudioFileRow]) -> None:
         self._audio_scan_running = False
+        rows = merge_rescan_rows(self._audio_scan_rows, rows)
         self._set_audio_scan_rows(rows)
 
     def _as_apply_filter(self) -> None:
         if not hasattr(self, "as_tree"):
             return
+        self._as_destroy_kind_editor()
         for item in self.as_tree.get_children():
             self.as_tree.delete(item)
         rows = filter_rows(
             self._audio_scan_rows,
             self.as_filter.get(),
             kind_filter=self.as_kind_filter.get(),
+        )
+        missing = paths_needing_duration(rows, only_paths={r.path for r in rows})
+        if missing:
+            self._start_duration_backfill(missing)
+        rows = sort_rows(
+            rows,
+            sort_key_from_label(self.as_sort_label.get()),
+            descending=bool(self.as_sort_desc.get()),
         )
         for r in rows:
             root_short = Path(r.root).name or r.root
@@ -1824,6 +2094,7 @@ class App:
                     r.rel_path,
                     r.name,
                     format_size(r.size_bytes),
+                    format_duration(r.duration_sec),
                     r.path,
                 ),
             )
@@ -1859,11 +2130,14 @@ class App:
         ttk.Button(filt, text="Apply", command=self._refresh_source_list).grid(
             row=0, column=2, padx=(8, 0)
         )
-        ttk.Button(filt, text="Play selected", command=self._src_play_selected).grid(
+        ttk.Button(filt, text="Refresh", command=self._src_manual_refresh).grid(
             row=0, column=3, padx=(8, 0)
         )
-        ttk.Button(filt, text="Process", command=self._src_go_process, style=BTN_STYLE_PROCESS).grid(
+        ttk.Button(filt, text="Play selected", command=self._src_play_selected).grid(
             row=0, column=4, padx=(8, 0)
+        )
+        ttk.Button(filt, text="Process", command=self._src_go_process, style=BTN_STYLE_PROCESS).grid(
+            row=0, column=5, padx=(8, 0)
         )
 
         sort_row = ttk.Frame(ctrl)
@@ -1896,10 +2170,9 @@ class App:
             table, columns=SRC_TREE_COLUMNS, show="headings", height=18, selectmode="browse"
         )
         headings = {
-            "root": "Root",
-            "rel": "Relative path",
             "name": "File",
             "size": "Size",
+            "duration": "Duration",
             "note": "Note",
             "converted": "Cvt",
             "path": "Full path",
@@ -1907,7 +2180,7 @@ class App:
         for key, label in headings.items():
             self.src_tree.heading(key, text=label)
             width = self._src_tree_col_widths.get(key, SRC_TREE_COL_DEFAULTS[key])
-            anchor = "center" if key in ("note", "converted") else "w"
+            anchor = "center" if key in ("note", "converted", "duration") else "w"
             self.src_tree.column(
                 key,
                 width=width,
@@ -1939,8 +2212,27 @@ class App:
 
         self.src_tree.bind("<Double-1>", self._src_on_tree_double_click)
         self.src_tree.bind("<Button-1>", self._src_on_tree_click, add="+")
+        self.src_tree.bind("<Button-3>", self._src_on_tree_right_click)
         self.src_tree.bind("<ButtonRelease-1>", self._on_src_tree_column_resize, add="+")
         self.src_tree.bind("<<TreeviewSelect>>", self._on_src_tree_select)
+
+        self._src_context_menu = tk.Menu(self.root, tearoff=0)
+        self._src_context_menu.add_command(
+            label="Play",
+            command=self._src_play_context_item,
+        )
+        self._src_context_menu.add_command(
+            label="Process",
+            command=self._src_process_context_item,
+        )
+        self._src_context_menu.add_command(
+            label="Show in Audio Scan",
+            command=self._src_show_in_audio_scan,
+        )
+        self._src_context_menu.add_command(
+            label="Show in Explorer",
+            command=self._src_show_context_path_in_explorer,
+        )
 
     @staticmethod
     def _parse_src_tree_col_widths(raw: object) -> dict[str, int]:
@@ -1956,21 +2248,26 @@ class App:
                 continue
             if width >= 40:
                 out[key] = width
+        if "name" not in out and "rel" in raw:
+            try:
+                width = int(raw["rel"])
+            except (TypeError, ValueError):
+                pass
+            else:
+                if width >= 40:
+                    out["name"] = width
         return out
 
     def _capture_src_tree_col_widths(self) -> None:
         if not hasattr(self, "src_tree"):
             return
-        widths: dict[str, int] = {}
         for key in SRC_TREE_COLUMNS:
             try:
                 width = int(self.src_tree.column(key, "width"))
             except (tk.TclError, TypeError, ValueError):
                 continue
             if width >= 40:
-                widths[key] = width
-        if widths:
-            self._src_tree_col_widths = widths
+                self._src_tree_col_widths[key] = width
 
     def _apply_src_tree_col_widths(self) -> None:
         if not hasattr(self, "src_tree"):
@@ -1986,9 +2283,20 @@ class App:
         if not hasattr(self, "src_tree"):
             return
         region = self.src_tree.identify_region(event.x, event.y)
-        if region != "separator":
+        if region not in ("separator", "heading"):
             return
         self._capture_src_tree_col_widths()
+        if self._src_colwidth_save_after_id is not None:
+            try:
+                self.root.after_cancel(self._src_colwidth_save_after_id)
+            except tk.TclError:
+                pass
+        self._src_colwidth_save_after_id = self.root.after(
+            300, self._save_src_col_widths_debounced
+        )
+
+    def _save_src_col_widths_debounced(self) -> None:
+        self._src_colwidth_save_after_id = None
         self._save_settings()
 
     def _on_src_tree_select(self, _event: tk.Event | None = None) -> None:
@@ -2014,14 +2322,113 @@ class App:
             inst = inst or found_i
         if vocals:
             self.im_input_path.set(vocals)
-        if inst:
-            self.im_bgm_path.set(inst)
         self._ensure_convert_stem_paths(self._convert_source_path)
         self._refresh_im_auto_paths()
         self._refresh_convert_results_list()
 
     def _src_note_column_id(self) -> str:
-        return "#5"
+        return "#4"
+
+    def _src_path_column_id(self) -> str:
+        return "#6"
+
+    def _src_path_from_item(self, item: str) -> str | None:
+        vals = self.src_tree.item(item, "values")
+        if not vals or len(vals) < 6:
+            return None
+        path = str(vals[5]).strip()
+        if not path or not Path(path).is_file():
+            return None
+        return path
+
+    def _src_on_tree_right_click(self, event: tk.Event) -> None:
+        if self.src_tree.identify_region(event.x, event.y) != "cell":
+            return
+        item = self.src_tree.identify_row(event.y)
+        if not item:
+            return
+        path = self._src_path_from_item(item)
+        if not path:
+            return
+        self.src_tree.selection_set(item)
+        self.src_tree.focus(item)
+        self._src_context_reveal_path = path
+        try:
+            self._src_context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._src_context_menu.grab_release()
+
+    def _src_play_context_item(self) -> None:
+        path = self._src_context_reveal_path or self._src_selected_path()
+        if not path:
+            return
+        self._playback_play_path(path)
+
+    def _src_process_context_item(self) -> None:
+        path = self._src_context_reveal_path or self._src_selected_path()
+        if not path:
+            return
+        self._src_go_process_path(path)
+
+    def _src_show_in_audio_scan(self) -> None:
+        path = self._src_context_reveal_path or self._src_selected_path()
+        if not path:
+            return
+        if not self._as_focus_path(path):
+            messagebox.showinfo(
+                "Audio Scan",
+                "File not found in the last scan.\nRun Scan on the Audio Scan tab first.",
+            )
+            return
+        self.notebook.select(TAB_AUDIO_SCAN)
+
+    def _as_focus_path(self, path: str) -> bool:
+        from audio_kind import kind_matches_filter
+        from audio_scan import _path_key
+
+        target = _path_key(path)
+        row = next(
+            (r for r in self._audio_scan_rows if _path_key(r.path) == target),
+            None,
+        )
+        if row is None:
+            return False
+
+        changed_filter = False
+        if not kind_matches_filter(row.kind, self.as_kind_filter.get()):
+            self.as_kind_filter.set("all")
+            changed_filter = True
+        q = self.as_filter.get().strip().lower()
+        if q:
+            hay = f"{row.rel_path} {row.name} {row.root} {row.kind_label}".lower()
+            if q not in hay:
+                self.as_filter.set("")
+                changed_filter = True
+        if changed_filter:
+            self._as_apply_filter()
+
+        for item in self.as_tree.get_children():
+            vals = self.as_tree.item(item, "values")
+            if len(vals) < 7:
+                continue
+            if _path_key(str(vals[6])) != target:
+                continue
+            self.as_tree.selection_set(item)
+            self.as_tree.focus(item)
+            self.as_tree.see(item)
+            return True
+        return False
+
+    def _src_show_context_path_in_explorer(self) -> None:
+        path = self._src_context_reveal_path or self._src_selected_path()
+        if not path:
+            return
+        try:
+            reveal_path_in_file_manager(path)
+        except FileNotFoundError:
+            messagebox.showerror("Show in Explorer", f"File not found:\n{path}")
+        except OSError as exc:
+            messagebox.showerror("Show in Explorer", str(exc))
 
     def _src_destroy_note_editor(self) -> None:
         if self._src_note_editor is not None:
@@ -2036,10 +2443,7 @@ class App:
     def _src_begin_note_edit(self, item: str) -> None:
         if not item:
             return
-        vals = self.src_tree.item(item, "values")
-        if not vals or len(vals) < 7:
-            return
-        path = str(vals[6]).strip()
+        path = self._src_path_from_item(item)
         if not path:
             return
         self._src_destroy_note_editor()
@@ -2087,8 +2491,8 @@ class App:
             if set_source_note(self._stem_links, path, note):
                 self._persist_stem_links()
             vals = list(self.src_tree.item(item, "values"))
-            if len(vals) >= 7:
-                vals[4] = note
+            if len(vals) >= 6:
+                vals[3] = note
                 self.src_tree.item(item, values=vals)
         finally:
             self._src_destroy_note_editor()
@@ -2121,11 +2525,12 @@ class App:
         sel = self.src_tree.selection()
         if not sel:
             return None
-        vals = self.src_tree.item(sel[0], "values")
-        if not vals or len(vals) < 7:
-            return None
-        path = str(vals[6]).strip()
-        return path if path and Path(path).is_file() else None
+        return self._src_path_from_item(sel[0])
+
+    def _src_manual_refresh(self) -> None:
+        self._stem_links = load_stem_links(self._db)
+        self._invalidate_source_display_cache()
+        self._refresh_source_list()
 
     def _src_play_selected(self) -> None:
         path = self._src_selected_path()
@@ -2139,6 +2544,9 @@ class App:
         if not path:
             messagebox.showinfo("Source Audio", "Select a file in the list first.")
             return
+        self._src_go_process_path(path)
+
+    def _src_go_process_path(self, path: str) -> None:
         self._process_source_path = path
         self._refresh_process_tab()
         self.notebook.select(TAB_PROCESS)
@@ -2154,6 +2562,9 @@ class App:
             self.src_filter.get(),
             kind_filter="source",
         )
+        missing = paths_needing_duration(rows, only_paths={r.path for r in rows})
+        if missing:
+            self._start_duration_backfill(missing)
         cache_key = self._source_display_cache_key()
         if (
             sort_only
@@ -2177,15 +2588,13 @@ class App:
             if item is None:
                 continue
             row, note, cvt_n = item
-            root_short = Path(row.root).name or row.root
             self.src_tree.insert(
                 "",
                 tk.END,
                 values=(
-                    root_short,
-                    row.rel_path,
                     row.name,
                     format_size(row.size_bytes),
+                    format_duration(row.duration_sec),
                     note,
                     str(cvt_n),
                     row.path,
@@ -2602,16 +3011,31 @@ class App:
             self.im_input_path.set(str(vocals.resolve()))
             self.log_queue.put(f"[separate] filled Convert vocals: {vocals}\n")
         if instru is not None:
-            self.im_bgm_path.set(str(instru.resolve()))
-            self.log_queue.put(f"[separate] filled Convert bgm_path: {instru}\n")
+            self.log_queue.put(f"[separate] found instrumental: {instru}\n")
+        source = self._resolve_convert_source()
+        if source and (vocals is not None or instru is not None):
+            if upsert_stem_link(
+                self._stem_links,
+                source,
+                vocals=str(vocals.resolve()) if vocals else None,
+                instrumental=str(instru.resolve()) if instru else None,
+            ):
+                self._persist_stem_links()
         self._refresh_im_auto_paths()
         self._refresh_convert_results_list()
 
     # ---- Tab 5: Convert ----
 
     def _build_tab_convert(self, parent: ttk.Frame) -> None:
-        source_box = ttk.LabelFrame(parent, text="Converting source audio", padding=10)
-        source_box.pack(fill="x", padx=4, pady=4)
+        _half_wrap = 360
+
+        top_row = ttk.Frame(parent)
+        top_row.pack(fill="x", padx=4, pady=4)
+        top_row.columnconfigure(0, weight=1, uniform="convert_top")
+        top_row.columnconfigure(1, weight=1, uniform="convert_top")
+
+        source_box = ttk.LabelFrame(top_row, text="Converting source audio", padding=10)
+        source_box.grid(row=0, column=0, sticky="new", padx=(0, 4))
         self._configure_cols(source_box)
 
         ttk.Label(source_box, text="File").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
@@ -2621,32 +3045,31 @@ class App:
         )
         ttk.Label(source_box, text="Path").grid(row=1, column=0, sticky="nw", padx=(0, 8), pady=4)
         self.conv_source_path_var = tk.StringVar(value="")
-        ttk.Label(source_box, textvariable=self.conv_source_path_var, wraplength=720).grid(
+        ttk.Label(source_box, textvariable=self.conv_source_path_var, wraplength=_half_wrap).grid(
             row=1, column=1, columnspan=3, sticky="w", pady=4
         )
         ttk.Label(source_box, text="Vocals (infer)").grid(
             row=2, column=0, sticky="nw", padx=(0, 8), pady=4
         )
         self.conv_vocals_path_var = tk.StringVar(value="")
-        ttk.Label(source_box, textvariable=self.conv_vocals_path_var, wraplength=720).grid(
+        ttk.Label(source_box, textvariable=self.conv_vocals_path_var, wraplength=_half_wrap).grid(
             row=2, column=1, columnspan=3, sticky="w", pady=4
         )
         ttk.Label(source_box, text="Instrumental (merge)").grid(
             row=3, column=0, sticky="nw", padx=(0, 8), pady=4
         )
         self.conv_bgm_path_var = tk.StringVar(value="")
-        ttk.Label(source_box, textvariable=self.conv_bgm_path_var, wraplength=720).grid(
+        ttk.Label(source_box, textvariable=self.conv_bgm_path_var, wraplength=_half_wrap).grid(
             row=3, column=1, columnspan=3, sticky="w", pady=4
         )
         ttk.Label(
             source_box,
             text="Set from Source Audio → Process → Convert. Infer uses the separated vocals stem.",
-            wraplength=720,
+            wraplength=_half_wrap,
         ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
-        results_box = ttk.LabelFrame(parent, text="Convert results", padding=6)
-        results_box.pack(fill="both", expand=True, padx=4, pady=4)
-        results_box.rowconfigure(1, weight=1)
+        results_box = ttk.LabelFrame(top_row, text="Convert results", padding=6)
+        results_box.grid(row=0, column=1, sticky="new", padx=(4, 0))
         results_box.columnconfigure(0, weight=1)
 
         result_ctrl = ttk.Frame(results_box)
@@ -2665,9 +3088,9 @@ class App:
             results_box, columns=cols, show="headings", height=8, selectmode="browse"
         )
         headings = {
-            "name": ("File", 220),
-            "size": ("Size", 80),
-            "path": ("Full path", 520),
+            "name": ("File", 140),
+            "size": ("Size", 64),
+            "path": ("Full path", 220),
         }
         for key, (label, width) in headings.items():
             self.conv_results_tree.heading(key, text=label)
@@ -2680,8 +3103,13 @@ class App:
         conv_xsb.grid(row=2, column=0, sticky="ew")
         self.conv_results_tree.bind("<Double-1>", lambda _e: self._conv_play_selected())
 
-        infer = ttk.LabelFrame(parent, text="Long infer", padding=10)
-        infer.pack(fill="x", padx=4, pady=4)
+        mid_row = ttk.Frame(parent)
+        mid_row.pack(fill="x", padx=4, pady=4)
+        mid_row.columnconfigure(0, weight=1, uniform="convert_mid")
+        mid_row.columnconfigure(1, weight=1, uniform="convert_mid")
+
+        infer = ttk.LabelFrame(mid_row, text="Long infer & merge", padding=10)
+        infer.grid(row=0, column=0, sticky="new", padx=(0, 4))
         self._configure_cols(infer)
 
         ttk.Label(infer, text="model (.pth)").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
@@ -2708,7 +3136,7 @@ class App:
             fav_row,
             textvariable=self.fav_model_pick,
             state="readonly",
-            width=56,
+            width=28,
         )
         self.fav_model_combo.grid(row=0, column=1, sticky="ew")
         self.fav_model_combo.bind("<<ComboboxSelected>>", self._apply_favorite_model)
@@ -2717,15 +3145,14 @@ class App:
         )
 
         self._row_path(infer, 2, "index (.index)", self.im_index_path, self._browse_im_index)
-        im_out_entry, im_out_btn = self._row_path(
-            infer, 3, "infer_output_dir", self.im_infer_output_dir, self._browse_im_infer_out_dir
+        self._row_readonly(infer, 3, "model_name", self.im_model_name)
+        self._row_path(
+            infer, 4, "merge_output_dir", self.im_merge_output_dir, self._browse_im_merge_out_dir
         )
-        self._register_exp_lock_widgets(im_out_entry, im_out_btn)
-        self._row_readonly(infer, 4, "opt_path", self.im_opt_path)
-        self._row_readonly(infer, 5, "model_name", self.im_model_name)
+        self._row_readonly(infer, 5, "merge_output_path", self.im_merge_output_path)
 
-        params = ttk.LabelFrame(parent, text="Infer parameters", padding=10)
-        params.pack(fill="x", padx=4, pady=4)
+        params = ttk.LabelFrame(mid_row, text="Infer parameters", padding=10)
+        params.grid(row=0, column=1, sticky="new", padx=(4, 0))
         for c in range(5):
             params.columnconfigure(c, weight=1)
 
@@ -2791,19 +3218,8 @@ class App:
                 "Speech tip: protect≈0.33, breath_mix_rate 0.5–0.85 (0=off; needs patched 0718). "
                 "index_rate 0.5–0.75. UV F0 no-interp is on in 0718 pipeline."
             ),
-            wraplength=880,
+            wraplength=_half_wrap,
         ).grid(row=6, column=0, columnspan=5, sticky="w", pady=(4, 0))
-
-        merge = ttk.LabelFrame(parent, text="Merge with BGM", padding=10)
-        merge.pack(fill="x", padx=4, pady=4)
-        self._configure_cols(merge)
-
-        self._row_path(merge, 0, "infer_result", self.im_infer_result, self._browse_im_infer_result)
-        self._row_path(merge, 1, "bgm_path", self.im_bgm_path, self._browse_im_bgm)
-        self._row_path(
-            merge, 2, "merge_output_dir", self.im_merge_output_dir, self._browse_im_merge_out_dir
-        )
-        self._row_readonly(merge, 3, "merge_output_path", self.im_merge_output_path)
 
         actions = ttk.Frame(parent)
         actions.pack(fill="x", padx=4, pady=8)
@@ -2822,13 +3238,10 @@ class App:
             self.im_model_path,
             self.im_model_name,
             self.im_input_path,
-            self.im_infer_output_dir,
-            self.im_infer_result,
             self.im_merge_output_dir,
-            self.im_bgm_path,
         ):
             var.trace_add("write", lambda *_a: self._refresh_im_auto_paths())
-        for var in (self.im_input_path, self.im_bgm_path):
+        for var in (self.im_input_path,):
             var.trace_add("write", lambda *_a: self._refresh_convert_results_list())
 
     def _ensure_convert_stem_paths(self, source: str) -> None:
@@ -2837,8 +3250,15 @@ class App:
             return
         if not self.im_input_path.get().strip() and link.vocals:
             self.im_input_path.set(link.vocals)
-        if not self.im_bgm_path.get().strip() and link.instrumental:
-            self.im_bgm_path.set(link.instrumental)
+
+    def _resolve_bgm_path(self) -> str | None:
+        source = self._resolve_convert_source()
+        if not source:
+            return None
+        _, inst = self._resolve_stems_for_source(source)
+        if inst and Path(inst).is_file():
+            return inst
+        return None
 
     def _resolve_convert_source(self) -> str | None:
         if self._convert_source_path and Path(self._convert_source_path).is_file():
@@ -2895,20 +3315,21 @@ class App:
         p = Path(source)
         self.conv_source_name_var.set(p.name)
         self.conv_source_path_var.set(str(p.resolve()))
-        vocals = self.im_input_path.get().strip()
-        bgm = self.im_bgm_path.get().strip()
-        link = self._stem_links.get(source_key(source))
-        if link:
-            if not vocals and link.vocals:
+        vocals, bgm = self._resolve_stems_for_source(source)
+        if not vocals:
+            link = self._stem_links.get(source_key(source))
+            if link and link.vocals:
                 vocals = link.vocals
-            if not bgm and link.instrumental:
+        if not bgm:
+            link = self._stem_links.get(source_key(source))
+            if link and link.instrumental:
                 bgm = link.instrumental
         self.conv_vocals_path_var.set(vocals or "(not set — run Separate on Process)")
         self.conv_bgm_path_var.set(bgm or "(not set — run Separate on Process)")
-        extra_dirs = [
-            self.im_merge_output_dir.get(),
-            self.im_infer_output_dir.get(),
-        ]
+        extra_dirs = [self.im_merge_output_dir.get()]
+        exp = self.active_exp_path.get().strip()
+        if exp:
+            extra_dirs.append(str(Path(exp) / "infer_long"))
         results = find_convert_results_for_source(
             source,
             self._stem_links,
@@ -2972,36 +3393,6 @@ class App:
         found = find_index_for_model(model, root)
         self.im_index_path.set(found or "")
 
-    def _browse_im_infer_out_dir(self) -> None:
-        if self.exp_locked:
-            return
-        path = filedialog.askdirectory(
-            title="Select infer output folder",
-            **self._path_dialog_opts(self.im_infer_output_dir.get()),
-        )
-        if path:
-            self.im_infer_output_dir.set(path)
-            self._refresh_im_auto_paths()
-
-    def _browse_im_infer_result(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Select infer result",
-            filetypes=AUDIO_FILETYPES,
-            **self._path_dialog_opts(self.im_infer_result.get(), for_file=True),
-        )
-        if path:
-            self.im_infer_result.set(path)
-            self._refresh_im_merge_output_path()
-
-    def _browse_im_bgm(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Select BGM audio",
-            filetypes=AUDIO_FILETYPES,
-            **self._path_dialog_opts(self.im_bgm_path.get(), for_file=True),
-        )
-        if path:
-            self.im_bgm_path.set(path)
-
     def _browse_im_merge_out_dir(self) -> None:
         path = filedialog.askdirectory(
             title="Select merge output folder",
@@ -3012,33 +3403,14 @@ class App:
             self._refresh_im_merge_output_path()
 
     def _refresh_im_auto_paths(self) -> None:
-        input_path = self.im_input_path.get().strip()
-        model_name = self.im_model_name.get().strip()
-        output_dir = self.im_infer_output_dir.get().strip()
-        if not output_dir:
-            output_dir = self._rvc_path("logs", "my_exp", "infer_long")
-            if output_dir:
-                self.im_infer_output_dir.set(output_dir)
-        if input_path and model_name and output_dir:
-            out_name = f"{Path(model_name).stem}_{Path(input_path).stem}.wav"
-            out_path = str(Path(output_dir) / out_name)
-            self.im_opt_path.set(out_path)
-            if not self.im_infer_result.get().strip():
-                self.im_infer_result.set(out_path)
         self._refresh_im_merge_output_path()
 
     def _refresh_im_merge_output_path(self) -> None:
-        src = self.im_infer_result.get().strip() or self.im_opt_path.get().strip()
         out_dir = self.im_merge_output_dir.get().strip()
-        if not src or not out_dir:
+        merged_name = self._merged_output_basename()
+        if not merged_name or not out_dir:
             self.im_merge_output_path.set("")
             return
-        src_name = Path(src).name
-        if "(Vocals)" in src_name:
-            merged_name = src_name.replace("(Vocals)", "(Merged)")
-        else:
-            stem = Path(src_name).stem
-            merged_name = f"{stem}(Merged){Path(src_name).suffix or '.wav'}"
         self.im_merge_output_path.set(str(Path(out_dir) / merged_name))
 
     # ------------------------------------------------------------------
@@ -3330,7 +3702,6 @@ class App:
         self._refresh_im_auto_paths()
         model_path = self.im_model_path.get().strip()
         input_path = self.im_input_path.get().strip()
-        opt_path = self.im_opt_path.get().strip()
         model_name = self.im_model_name.get().strip()
         index_path = self.im_index_path.get().strip()
 
@@ -3344,9 +3715,6 @@ class App:
                 "Open Source Audio → Process, run Separate, then Convert.",
             )
             return None
-        if not opt_path:
-            messagebox.showerror("Missing opt_path", "Set model and vocals stem first.")
-            return None
         if not model_name:
             model_name = Path(model_path).name
             self.im_model_name.set(model_name)
@@ -3354,6 +3722,8 @@ class App:
             messagebox.showerror("Missing index", f"Index file not found:\n{index_path}")
             return None
 
+        opt_path = str(self._allocate_infer_temp_path(model_path, input_path))
+        self._convert_infer_temp = opt_path
         Path(opt_path).parent.mkdir(parents=True, exist_ok=True)
         py = str(rvc_python(root))
         script = str(SCRIPTS_DIR / "infer_long.py")
@@ -3394,16 +3764,18 @@ class App:
         env_extra = {"weight_root": str(Path(model_path).parent)}
         return cmd, opt_path, env_extra
 
-    def _build_merge_cmd(self) -> tuple[list[str], str, str] | None:
-        infer_result = self.im_infer_result.get().strip()
-        bgm_path = self.im_bgm_path.get().strip()
+    def _build_merge_cmd(self, bgm_path: str) -> tuple[list[str], str, str] | None:
+        infer_result = (self._convert_infer_temp or "").strip()
         merge_out = self.im_merge_output_path.get().strip()
 
         if not infer_result or not Path(infer_result).is_file():
             messagebox.showerror("Missing result", "Infer output not found for merge.")
             return None
         if not bgm_path or not Path(bgm_path).is_file():
-            messagebox.showerror("Missing BGM", "Select a valid background audio file.")
+            messagebox.showerror(
+                "Missing instrumental",
+                "Instrumental stem not found.\nRun Separate on the Process tab first.",
+            )
             return None
         if not self.im_merge_output_dir.get().strip():
             messagebox.showerror("Missing output", "Select a valid merge_output_dir.")
@@ -3450,10 +3822,12 @@ class App:
             return
         infer_cmd, opt_path, env_extra = built
         convert_source = self._resolve_convert_source()
-
-        bgm_path = self.im_bgm_path.get().strip()
-        if not bgm_path or not Path(bgm_path).is_file():
-            messagebox.showerror("Missing BGM", "Select a valid background audio file.")
+        bgm_path = self._resolve_bgm_path()
+        if not bgm_path:
+            messagebox.showerror(
+                "Missing instrumental",
+                "Instrumental stem not found.\nRun Separate on the Process tab first.",
+            )
             return
         if not self.im_merge_output_dir.get().strip():
             messagebox.showerror("Missing output", "Select a valid merge_output_dir.")
@@ -3464,9 +3838,8 @@ class App:
             return
 
         def after_infer() -> None:
-            self.im_infer_result.set(opt_path)
             self._refresh_im_merge_output_path()
-            merge_built = self._build_merge_cmd()
+            merge_built = self._build_merge_cmd(bgm_path)
             if merge_built is None:
                 messagebox.showerror(
                     "Convert",
@@ -3486,13 +3859,15 @@ class App:
                         and infer_path.resolve() != merge_path.resolve()
                     ):
                         infer_path.unlink()
-                        note = f"\n\nDeleted intermediate infer result:\n{infer_result}"
-                        self.log_queue.put(f"[convert] deleted infer result: {infer_result}\n")
+                        note = "\n\nDeleted temporary infer file."
+                        self.log_queue.put(f"[convert] deleted infer temp: {infer_result}\n")
                 except OSError as exc:
-                    note = f"\n\nCould not delete infer result:\n{exc}"
-                    self.log_queue.put(f"[convert] delete infer result failed: {exc}\n")
+                    note = f"\n\nCould not delete infer temp file:\n{exc}"
+                    self.log_queue.put(f"[convert] delete infer temp failed: {exc}\n")
+                self._convert_infer_temp = None
                 self._record_convert_result(convert_source, merge_out)
                 self._refresh_convert_results_list()
+                self._refresh_source_list()
                 messagebox.showinfo("Convert done", f"Output:\n{merge_out}{note}")
 
             self._run_cmd(merge_cmd, root, on_success=after_merge, chain=True)

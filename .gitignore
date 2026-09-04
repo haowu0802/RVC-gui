@@ -26,8 +26,7 @@ Thumbs.db
 .idea/
 .vscode/
 
-# Temp / outputs
-TEMP/
+.convert_tmp/
 *.log
 *.wav
 *.flac

@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from dataclasses import dataclass
+import subprocess
+import sys
+from dataclasses import dataclass, replace
 from pathlib import Path
 
-from audio_kind import KIND_DISPLAY, classify_audio_kind, kind_matches_filter
+from audio_kind import KIND_DISPLAY, classify_audio_kind, kind_label, kind_matches_filter, normalize_kind
 
 AUDIO_EXTS = {".wav", ".flac", ".mp3", ".m4a", ".ogg", ".aac"}
 
@@ -14,6 +16,7 @@ SRC_SORT_LABELS: dict[str, str] = {
     "rel_path": "Relative path",
     "name": "File name",
     "size": "Size",
+    "duration": "Duration",
     "mtime": "Modified",
     "ctime": "Created",
     "root": "Root folder",
@@ -42,10 +45,11 @@ class AudioFileRow:
     mtime_ns: int
     ctime_ns: int
     kind: str
+    duration_sec: float = 0.0
 
     @property
     def kind_label(self) -> str:
-        return KIND_DISPLAY.get(self.kind, self.kind)
+        return kind_label(self.kind)
 
     @property
     def size_mb(self) -> float:
@@ -87,6 +91,8 @@ def sort_rows(
     key_name = sort_by if sort_by in SRC_SORT_LABELS else "rel_path"
     if key_name == "size":
         key_fn = lambda r: r.size_bytes
+    elif key_name == "duration":
+        key_fn = lambda r: r.duration_sec
     elif key_name == "mtime":
         key_fn = lambda r: r.mtime_ns
     elif key_name == "ctime":
@@ -100,6 +106,74 @@ def sort_rows(
     else:
         key_fn = lambda r: (r.root.lower(), r.rel_path.lower())
     return sorted(rows, key=key_fn, reverse=descending)
+
+
+def probe_duration_sec(path: Path | str) -> float:
+    from playback import audio_duration_ms
+
+    ms = audio_duration_ms(path)
+    if ms > 0:
+        return ms / 1000.0
+    try:
+        kwargs: dict = {
+            "text": True,
+            "stderr": subprocess.DEVNULL,
+        }
+        if sys.platform == "win32":
+            # Avoid a console flash for every file (common for mp3 via ffprobe).
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+        out = subprocess.check_output(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            **kwargs,
+        ).strip()
+        return float(out) if out else 0.0
+    except Exception:
+        return 0.0
+
+
+def collect_duration_updates(paths: list[str]) -> dict[str, float]:
+    updates: dict[str, float] = {}
+    for path in paths:
+        dur = probe_duration_sec(path)
+        if dur > 0:
+            updates[path] = dur
+    return updates
+
+
+def apply_duration_updates(
+    rows: list[AudioFileRow],
+    updates: dict[str, float],
+) -> list[AudioFileRow]:
+    if not updates:
+        return rows
+    return [
+        replace(r, duration_sec=updates[r.path]) if r.path in updates else r
+        for r in rows
+    ]
+
+
+def paths_needing_duration(
+    rows: list[AudioFileRow],
+    *,
+    only_paths: set[str] | None = None,
+) -> list[str]:
+    out: list[str] = []
+    for row in rows:
+        if row.duration_sec > 0:
+            continue
+        if only_paths is not None and row.path not in only_paths:
+            continue
+        out.append(row.path)
+    return out
 
 
 def _should_skip_dir(name: str) -> bool:
@@ -151,6 +225,7 @@ def scan_audio_roots(roots: list[str]) -> list[AudioFileRow]:
                         mtime_ns=mtime_ns,
                         ctime_ns=ctime_ns,
                         kind=classify_audio_kind(fn, rel_norm),
+                        duration_sec=probe_duration_sec(p),
                     )
                 )
     out.sort(key=lambda r: (r.root.lower(), r.rel_path.lower()))
@@ -202,6 +277,17 @@ def format_size(n: int) -> str:
     return f"{n / (1024 * 1024 * 1024):.2f} GB"
 
 
+def format_duration(sec: float) -> str:
+    if sec <= 0:
+        return ""
+    total = int(sec + 0.5)
+    minutes, seconds = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
 def row_to_dict(row: AudioFileRow) -> dict[str, object]:
     return {
         "root": row.root,
@@ -212,6 +298,7 @@ def row_to_dict(row: AudioFileRow) -> dict[str, object]:
         "mtime_ns": row.mtime_ns,
         "ctime_ns": row.ctime_ns,
         "kind": row.kind,
+        "duration_sec": row.duration_sec,
     }
 
 
@@ -225,10 +312,44 @@ def row_from_dict(data: dict[str, object]) -> AudioFileRow | None:
             size_bytes=int(data["size_bytes"]),  # type: ignore[arg-type]
             mtime_ns=int(data["mtime_ns"]),  # type: ignore[arg-type]
             ctime_ns=int(data.get("ctime_ns", data.get("mtime_ns", 0))),  # type: ignore[arg-type]
-            kind=str(data["kind"]),
+            kind=normalize_kind(str(data["kind"])),
+            duration_sec=float(data.get("duration_sec", 0.0)),  # type: ignore[arg-type]
         )
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def _path_key(path: str) -> str:
+    try:
+        return str(Path(path).resolve())
+    except OSError:
+        return path
+
+
+def merge_rescan_rows(
+    existing: list[AudioFileRow],
+    scanned: list[AudioFileRow],
+) -> list[AudioFileRow]:
+    """Keep user-edited kind/duration when rescanning known paths."""
+    by_path = {_path_key(r.path): r for r in existing}
+    out: list[AudioFileRow] = []
+    for row in scanned:
+        prev = by_path.get(_path_key(row.path))
+        if prev is None:
+            out.append(row)
+            continue
+        duration = prev.duration_sec if prev.duration_sec > 0 else row.duration_sec
+        out.append(replace(row, kind=prev.kind, duration_sec=duration))
+    return out
+
+
+def update_row_kind(rows: list[AudioFileRow], path: str, kind: str) -> list[AudioFileRow]:
+    target = _path_key(path)
+    new_kind = normalize_kind(kind)
+    return [
+        replace(r, kind=new_kind) if _path_key(r.path) == target else r
+        for r in rows
+    ]
 
 
 def load_scan_cache(
