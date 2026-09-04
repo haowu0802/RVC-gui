@@ -8,6 +8,8 @@ import sqlite3
 
 from app_db import load_stem_links_db, resolve_conn, save_stem_links_db
 
+SCORE_MAX = 3
+
 
 @dataclass
 class StemLink:
@@ -15,7 +17,30 @@ class StemLink:
     instrumental: str | None = None
     convert_results: list[str] | None = None
     note: str | None = None
+    score: int = 0
     updated_ns: int = 0
+
+
+def clamp_score(score: int | None) -> int:
+    try:
+        n = int(score or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(SCORE_MAX, n))
+
+
+def format_score_stars(score: int | None) -> str:
+    """Display ★/☆ for 0–3 (clickable in the Source Audio tree)."""
+    n = clamp_score(score)
+    return ("★" * n) + ("☆" * (SCORE_MAX - n))
+
+
+def score_from_click_x(rel_x: int, width: int, *, max_score: int = SCORE_MAX) -> int:
+    """Map a click x within the score cell to 1..max_score."""
+    if width <= 0:
+        return 1
+    slot = int(rel_x * max_score / width) + 1
+    return max(1, min(max_score, slot))
 
 
 def source_key(path: str) -> str:
@@ -55,6 +80,24 @@ def get_linked_stems(
     return valid_audio_path(link.vocals), valid_audio_path(link.instrumental)
 
 
+def _replace_link(cur: StemLink | None, **kwargs) -> StemLink:
+    base = cur or StemLink()
+    return StemLink(
+        vocals=kwargs["vocals"] if "vocals" in kwargs else base.vocals,
+        instrumental=(
+            kwargs["instrumental"] if "instrumental" in kwargs else base.instrumental
+        ),
+        convert_results=(
+            kwargs["convert_results"]
+            if "convert_results" in kwargs
+            else (list(base.convert_results) if base.convert_results else None)
+        ),
+        note=kwargs["note"] if "note" in kwargs else base.note,
+        score=clamp_score(kwargs["score"] if "score" in kwargs else base.score),
+        updated_ns=int(kwargs.get("updated_ns") or time.time_ns()),
+    )
+
+
 def upsert_stem_link(
     links: dict[str, StemLink],
     source: str,
@@ -74,12 +117,10 @@ def upsert_stem_link(
     prev_i = valid_audio_path(cur.instrumental) if cur else None
     if merged_v == prev_v and merged_i == prev_i:
         return False
-    links[key] = StemLink(
+    links[key] = _replace_link(
+        cur,
         vocals=merged_v,
         instrumental=merged_i,
-        convert_results=list(cur.convert_results or []) if cur else None,
-        note=cur.note if cur else None,
-        updated_ns=time.time_ns(),
     )
     return True
 
@@ -109,15 +150,11 @@ def add_convert_result(
     prev = list(cur.convert_results or []) if cur else []
     if valid in prev:
         return False
-    vocals = valid_audio_path(cur.vocals) if cur else None
-    instrumental = valid_audio_path(cur.instrumental) if cur else None
-    updated = prev + [valid]
-    links[key] = StemLink(
-        vocals=vocals,
-        instrumental=instrumental,
-        convert_results=updated,
-        note=cur.note if cur else None,
-        updated_ns=time.time_ns(),
+    links[key] = _replace_link(
+        cur,
+        vocals=valid_audio_path(cur.vocals) if cur else None,
+        instrumental=valid_audio_path(cur.instrumental) if cur else None,
+        convert_results=prev + [valid],
     )
     return True
 
@@ -140,11 +177,37 @@ def set_source_note(
     prev = cur.note if cur and cur.note else ""
     if new_note == prev:
         return False
-    links[key] = StemLink(
+    links[key] = _replace_link(
+        cur,
         vocals=valid_audio_path(cur.vocals) if cur else None,
         instrumental=valid_audio_path(cur.instrumental) if cur else None,
-        convert_results=list(cur.convert_results or []) if cur else None,
         note=new_note or None,
-        updated_ns=time.time_ns(),
+    )
+    return True
+
+
+def get_source_score(source: str, links: dict[str, StemLink]) -> int:
+    link = links.get(source_key(source))
+    if not link:
+        return 0
+    return clamp_score(link.score)
+
+
+def set_source_score(
+    links: dict[str, StemLink],
+    source: str,
+    score: int,
+) -> bool:
+    key = source_key(source)
+    cur = links.get(key)
+    new_score = clamp_score(score)
+    prev = clamp_score(cur.score if cur else 0)
+    if new_score == prev and cur is not None:
+        return False
+    links[key] = _replace_link(
+        cur,
+        vocals=valid_audio_path(cur.vocals) if cur else None,
+        instrumental=valid_audio_path(cur.instrumental) if cur else None,
+        score=new_score,
     )
     return True

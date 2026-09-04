@@ -5,6 +5,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -17,6 +18,7 @@ SRC_SORT_LABELS: dict[str, str] = {
     "name": "File name",
     "size": "Size",
     "duration": "Duration",
+    "score": "Score",
     "mtime": "Modified",
     "ctime": "Created",
     "root": "Root folder",
@@ -185,9 +187,18 @@ def _should_skip_dir(name: str) -> bool:
     return False
 
 
-def scan_audio_roots(roots: list[str]) -> list[AudioFileRow]:
-    """Walk each root recursively and collect audio files."""
-    out: list[AudioFileRow] = []
+def scan_audio_roots(
+    roots: list[str],
+    *,
+    on_progress: Callable[[int, int, str], None] | None = None,
+) -> list[AudioFileRow]:
+    """Walk each root recursively and collect audio files.
+
+    ``on_progress(done, total, message)`` is optional. During listing,
+    ``total`` is 0 and ``done`` is files found so far; while probing
+    durations, ``done``/``total`` are determinate.
+    """
+    candidates: list[tuple[str, str, str, str, int, int, int, str]] = []
     seen: set[str] = set()
     for root_s in roots:
         root = Path(root_s).expanduser()
@@ -215,20 +226,56 @@ def scan_audio_roots(roots: list[str]) -> list[AudioFileRow]:
                 rel_norm = rel.replace("\\", "/")
                 mtime_ns = _stat_time_ns(st, "mtime", "mtime")
                 ctime_ns = _stat_time_ns(st, "birthtime", "ctime") or mtime_ns
-                out.append(
-                    AudioFileRow(
-                        root=root_resolved,
-                        rel_path=rel_norm,
-                        name=fn,
-                        path=path_s,
-                        size_bytes=int(st.st_size),
-                        mtime_ns=mtime_ns,
-                        ctime_ns=ctime_ns,
-                        kind=classify_audio_kind(fn, rel_norm),
-                        duration_sec=probe_duration_sec(p),
+                candidates.append(
+                    (
+                        root_resolved,
+                        rel_norm,
+                        fn,
+                        path_s,
+                        int(st.st_size),
+                        mtime_ns,
+                        ctime_ns,
+                        classify_audio_kind(fn, rel_norm),
                     )
                 )
+                if on_progress and len(candidates) % 50 == 0:
+                    on_progress(
+                        len(candidates),
+                        0,
+                        f"Listing… {len(candidates)} files",
+                    )
+
+    if on_progress:
+        on_progress(
+            len(candidates),
+            0,
+            f"Listing done — {len(candidates)} files, probing duration…",
+        )
+
+    out: list[AudioFileRow] = []
+    total = len(candidates)
+    for i, (root_resolved, rel_norm, fn, path_s, size, mtime_ns, ctime_ns, kind) in enumerate(
+        candidates, start=1
+    ):
+        out.append(
+            AudioFileRow(
+                root=root_resolved,
+                rel_path=rel_norm,
+                name=fn,
+                path=path_s,
+                size_bytes=size,
+                mtime_ns=mtime_ns,
+                ctime_ns=ctime_ns,
+                kind=kind,
+                duration_sec=probe_duration_sec(path_s),
+            )
+        )
+        if on_progress and (i == 1 or i % 5 == 0 or i == total):
+            on_progress(i, total, f"Scanning… {i}/{total}")
+
     out.sort(key=lambda r: (r.root.lower(), r.rel_path.lower()))
+    if on_progress and total:
+        on_progress(total, total, f"Scan complete — {total} files")
     return out
 
 

@@ -39,13 +39,28 @@ from convert_match import (
 from source_match import find_separated_for_source
 from app_db import DB_PATH, connect, load_settings_map, save_settings_map
 from stem_links import (
+    SCORE_MAX,
     add_convert_result,
+    format_score_stars,
     get_source_note,
+    get_source_score,
     load_stem_links,
     save_stem_links,
+    score_from_click_x,
     set_source_note,
+    set_source_score,
     source_key,
     upsert_stem_link,
+)
+from shared_catalog import (
+    SHARED_CATALOG_PATH,
+    apply_catalog_to_state,
+    build_catalog_from_state,
+    load_shared_catalog,
+    save_shared_catalog,
+    set_kind_for_name,
+    set_note_for_stem,
+    set_score_for_stem,
 )
 from audio_scan import (
     AudioFileRow,
@@ -99,13 +114,14 @@ TAB_NAMES = [
     "Convert",
 ]
 
-SRC_TREE_COLUMNS = ("name", "size", "duration", "note", "converted", "path")
+SRC_TREE_COLUMNS = ("name", "size", "duration", "note", "score", "converted", "path")
 SRC_TREE_COL_DEFAULTS: dict[str, int] = {
     "name": 200,
     "size": 70,
     "duration": 72,
-    "note": 180,
-    "converted": 56,
+    "note": 160,
+    "score": 64,
+    "converted": 48,
     "path": 360,
 }
 
@@ -238,11 +254,16 @@ def _apply_theme(root: tk.Tk, light: bool) -> dict[str, str]:
         fieldbackground=colors["field"],
         foreground=colors["fg"],
         background=colors["button"],
+        arrowcolor=colors["fg"],
     )
     style.map(
         "TCombobox",
-        fieldbackground=[("readonly", colors["field"])],
-        foreground=[("readonly", colors["fg"])],
+        fieldbackground=[("readonly", colors["field"]), ("disabled", colors["field"])],
+        foreground=[("readonly", colors["fg"]), ("disabled", colors["disabled"])],
+        # Without these, readonly Combobox text is often blank until a second click
+        # (Windows / clam dark themes select the whole field with invisible colors).
+        selectbackground=[("readonly", colors["field"]), ("!readonly", colors["select"])],
+        selectforeground=[("readonly", colors["fg"]), ("!readonly", colors["select_fg"])],
     )
     style.configure("TNotebook", background=colors["bg"], borderwidth=0)
     style.configure("TNotebook.Tab", background=colors["button"], foreground=colors["fg"], padding=[10, 4])
@@ -463,6 +484,8 @@ class App:
         self.src_filter = tk.StringVar(value="")
         self.src_sort_label = tk.StringVar(value=sort_label("rel_path"))
         self.src_sort_desc = tk.BooleanVar(value=False)
+        # Multi-select score filter: index 0..SCORE_MAX (☆☆☆ .. ★★★). All on = no filter.
+        self.src_score_filters = [tk.BooleanVar(value=True) for _ in range(SCORE_MAX + 1)]
         self.audio_scan_roots: list[str] = []
         self._audio_scan_rows: list[AudioFileRow] = []
         self._audio_scan_running = False
@@ -477,10 +500,11 @@ class App:
         self._src_context_reveal_path: str | None = None
         self._db = connect()
         self._stem_links = load_stem_links(self._db)
+        self._shared_catalog = load_shared_catalog()
         self._audio_scan_revision = 0
         self._stem_links_revision = 0
         self._src_display_cache_key: tuple[object, ...] | None = None
-        self._src_display_cache_payload: list[tuple[AudioFileRow, str, int]] | None = None
+        self._src_display_cache_payload: list[tuple[AudioFileRow, str, int, int]] | None = None
         self._duration_backfill_running = False
         self._as_kind_editor: ttk.Combobox | None = None
         self._as_kind_edit_item: str | None = None
@@ -538,7 +562,52 @@ class App:
     def _persist_stem_links(self) -> None:
         save_stem_links(self._stem_links, self._db)
         self._stem_links_revision += 1
-        self._invalidate_source_display_cache()
+
+    def _persist_shared_catalog(self) -> None:
+        try:
+            save_shared_catalog(self._shared_catalog)
+        except OSError:
+            pass
+
+    def _apply_shared_catalog(self, *, persist_db: bool = True) -> tuple[int, int]:
+        """Merge shared_catalog.json into live links/rows. Returns (notes, kinds) changed."""
+        self._shared_catalog = load_shared_catalog()
+        links, rows, n_notes, n_scores, n_kinds = apply_catalog_to_state(
+            self._shared_catalog,
+            self._stem_links,
+            self._audio_scan_rows,
+        )
+        self._stem_links = links
+        self._audio_scan_rows = rows
+        if persist_db and (n_notes or n_scores or n_kinds):
+            if n_notes or n_scores:
+                self._persist_stem_links()
+            if n_kinds:
+                self._audio_scan_revision += 1
+                try:
+                    save_scan_cache(self._db, self._audio_scan_rows)
+                except OSError:
+                    pass
+            self._invalidate_source_display_cache()
+        return n_notes + n_scores, n_kinds
+
+    def _sync_shared_catalog_from_db(self) -> Path:
+        """Rebuild shared_catalog.json from current notes + kind overrides."""
+        self._shared_catalog = build_catalog_from_state(
+            self._stem_links,
+            self._audio_scan_rows,
+            only_kind_overrides=True,
+        )
+        return save_shared_catalog(self._shared_catalog)
+
+    def _src_selected_scores(self) -> frozenset[int] | None:
+        """Scores to show. None = show all (nothing or everything checked)."""
+        selected = frozenset(
+            i for i, var in enumerate(self.src_score_filters) if bool(var.get())
+        )
+        if not selected or selected == frozenset(range(SCORE_MAX + 1)):
+            return None
+        return selected
 
     def _source_display_cache_key(self) -> tuple[object, ...]:
         return (
@@ -550,15 +619,16 @@ class App:
 
     def _build_source_display_payload(
         self, rows: list[AudioFileRow]
-    ) -> list[tuple[AudioFileRow, str, int]]:
+    ) -> list[tuple[AudioFileRow, str, int, int]]:
         paths = [r.path for r in rows]
         count_map = build_convert_count_map(paths, self._stem_links, self._audio_scan_rows)
-        payload: list[tuple[AudioFileRow, str, int]] = []
+        payload: list[tuple[AudioFileRow, str, int, int]] = []
         for r in rows:
             note = get_source_note(r.path, self._stem_links)
+            score = get_source_score(r.path, self._stem_links)
             key = str(Path(r.path).resolve())
             cvt_n = count_map.get(key, 0)
-            payload.append((r, note, cvt_n))
+            payload.append((r, note, cvt_n, score))
         return payload
 
     # ------------------------------------------------------------------
@@ -644,20 +714,39 @@ class App:
         return Path(path)
 
     def _merged_output_basename(self) -> str:
-        input_path = self.im_input_path.get().strip()
+        """Build merge filename: ``{model}_{source_stem}_(Merged).{ext}`` when possible."""
         model_name = self.im_model_name.get().strip()
-        if not input_path:
+        model_path = self.im_model_path.get().strip()
+        model_stem = (
+            Path(model_name).stem
+            if model_name
+            else (Path(model_path).stem if model_path else "")
+        )
+
+        input_path = self.im_input_path.get().strip()
+        source = (self._convert_source_path or "").strip()
+        if source and Path(source).is_file():
+            base_stem = Path(source).stem
+            suffix = Path(input_path).suffix if input_path else Path(source).suffix
+            if not suffix:
+                suffix = ".flac"
+            merged_name = f"{base_stem}_(Merged){suffix}"
+        elif input_path:
+            src_name = Path(input_path).name
+            # MelBand stems: keep path but swap (Vocals) → (Merged) (any case).
+            if re.search(r"\(vocals\)", src_name, flags=re.IGNORECASE):
+                merged_name = re.sub(
+                    r"\(vocals\)", "(Merged)", src_name, count=1, flags=re.IGNORECASE
+                )
+            else:
+                suffix = Path(src_name).suffix or ".flac"
+                merged_name = f"{Path(input_path).stem}_(Merged){suffix}"
+        else:
             return ""
-        src_name = Path(input_path).name
-        if "(Vocals)" in src_name:
-            return src_name.replace("(Vocals)", "(Merged)")
-        model_stem = Path(model_name).stem if model_name else Path(
-            self.im_model_path.get()
-        ).stem
-        input_stem = Path(input_path).stem
-        stem = f"{model_stem}_{input_stem}" if model_stem else input_stem
-        suffix = Path(src_name).suffix or ".wav"
-        return f"{stem}(Merged){suffix}"
+
+        if model_stem and not merged_name.lower().startswith(model_stem.lower() + "_"):
+            merged_name = f"{model_stem}_{merged_name}"
+        return merged_name
 
     def _register_exp_lock_widgets(self, *widgets: tk.Widget) -> None:
         for w in widgets:
@@ -965,6 +1054,9 @@ class App:
             "src_filter": self.src_filter.get(),
             "src_sort_by": sort_key_from_label(self.src_sort_label.get()),
             "src_sort_desc": bool(self.src_sort_desc.get()),
+            "src_score_filter": [
+                i for i, var in enumerate(self.src_score_filters) if bool(var.get())
+            ],
             "src_tree_col_widths": dict(self._src_tree_col_widths),
             "convert_source_path": self._convert_source_path or "",
             "im_model_path": self.im_model_path.get(),
@@ -1036,6 +1128,14 @@ class App:
         for key, var in str_vars.items():
             if key in data and data[key] is not None:
                 var.set(str(data[key]))
+        # Kind filter Combobox values are display labels ("source audio"), not keys.
+        kind_raw = self.as_kind_filter.get().strip()
+        if kind_raw.lower() in ("", "all"):
+            self.as_kind_filter.set("all")
+        elif kind_raw in KIND_FILTER_VALUES:
+            self.as_kind_filter.set(kind_raw)
+        else:
+            self.as_kind_filter.set(kind_label(kind_raw))
         if "pb_volume" in data:
             try:
                 self.pb_volume.set(float(data["pb_volume"]))
@@ -1055,6 +1155,16 @@ class App:
         self.as_sort_label.set(sort_label(as_sort_by))
         if "as_sort_desc" in data:
             self.as_sort_desc.set(bool(data["as_sort_desc"]))
+        raw_scores = data.get("src_score_filter")
+        if isinstance(raw_scores, list):
+            wanted = {int(x) for x in raw_scores if str(x).isdigit() or isinstance(x, int)}
+            wanted = {n for n in wanted if 0 <= n <= SCORE_MAX}
+            if wanted:
+                for i, var in enumerate(self.src_score_filters):
+                    var.set(i in wanted)
+            else:
+                for var in self.src_score_filters:
+                    var.set(True)
 
         geo = data.get("geometry")
         if isinstance(geo, str) and geo:
@@ -1138,6 +1248,7 @@ class App:
             self.as_filter,
             self.as_kind_filter,
             self.src_filter,
+            *self.src_score_filters,
             self.im_model_path,
             self.im_model_name,
             self.im_index_path,
@@ -1644,6 +1755,36 @@ class App:
             justify="left",
         ).grid(row=3, column=0, columnspan=5, sticky="w", pady=(8, 0))
 
+        shared = ttk.LabelFrame(parent, text="Shared catalog (git)", padding=10)
+        shared.pack(fill="x", padx=4, pady=4)
+        self._configure_cols(shared)
+        self.shared_catalog_path_var = tk.StringVar(value=str(SHARED_CATALOG_PATH))
+        ttk.Label(shared, text="File").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(shared, textvariable=self.shared_catalog_path_var, state="readonly").grid(
+            row=0, column=1, columnspan=3, sticky="ew", pady=4
+        )
+        shared_btns = ttk.Frame(shared)
+        shared_btns.grid(row=1, column=0, columnspan=5, sticky="w", pady=(4, 0))
+        ttk.Button(
+            shared_btns,
+            text="Export DB → catalog",
+            command=self._on_export_shared_catalog,
+        ).pack(side="left", padx=(0, 8))
+        ttk.Button(
+            shared_btns,
+            text="Import catalog → DB",
+            command=self._on_import_shared_catalog,
+        ).pack(side="left", padx=(0, 8))
+        ttk.Label(
+            shared,
+            text=(
+                "Portable: notes/scores keyed by filename stem; kinds keyed by filename. "
+                "Commit shared_catalog.json to version triage across machines."
+            ),
+            wraplength=900,
+            justify="left",
+        ).grid(row=2, column=0, columnspan=5, sticky="w", pady=(8, 0))
+
         ttk.Label(
             parent,
             text=f"Local database: {DB_PATH}",
@@ -1651,6 +1792,30 @@ class App:
         ).pack(anchor="w", padx=8, pady=8)
 
         self.rvc_root.trace_add("write", lambda *_a: self._on_rvc_root_changed())
+
+    def _on_export_shared_catalog(self) -> None:
+        try:
+            path = self._sync_shared_catalog_from_db()
+        except OSError as exc:
+            messagebox.showerror("Shared catalog", str(exc))
+            return
+        n_notes = len(self._shared_catalog.notes_by_stem)
+        n_scores = len(self._shared_catalog.scores_by_stem)
+        n_kinds = len(self._shared_catalog.kinds_by_name)
+        messagebox.showinfo(
+            "Shared catalog",
+            f"Exported notes={n_notes} scores={n_scores} kind_overrides={n_kinds}\n{path}",
+        )
+
+    def _on_import_shared_catalog(self) -> None:
+        n_notes, n_kinds = self._apply_shared_catalog(persist_db=True)
+        self._as_apply_filter()
+        self._refresh_source_list()
+        messagebox.showinfo(
+            "Shared catalog",
+            f"Imported from {SHARED_CATALOG_PATH}\n"
+            f"notes_updated={n_notes} kinds_updated={n_kinds}",
+        )
 
     def _browse_sep_venv(self) -> None:
         path = filedialog.askdirectory(
@@ -1716,7 +1881,7 @@ class App:
         list_wrap.columnconfigure(0, weight=1)
         self.as_roots_list = tk.Listbox(
             list_wrap,
-            height=5,
+            height=4,
             exportselection=False,
             bg=self.colors["field"],
             fg=self.colors["fg"],
@@ -1732,48 +1897,57 @@ class App:
         btns.grid(row=1, column=4, sticky="n", padx=(8, 0))
         ttk.Button(btns, text="Add folder…", command=self._as_add_root).pack(fill="x", pady=2)
         ttk.Button(btns, text="Remove", command=self._as_remove_root).pack(fill="x", pady=2)
-        ttk.Button(btns, text="Scan", command=self._as_start_scan).pack(fill="x", pady=(12, 2))
+        self.as_scan_btn = ttk.Button(btns, text="Scan", command=self._as_start_scan)
+        self.as_scan_btn.pack(fill="x", pady=(12, 2))
 
         filt = ttk.Frame(roots_frame)
         filt.grid(row=2, column=0, columnspan=5, sticky="ew", pady=(8, 0))
         filt.columnconfigure(1, weight=1)
         ttk.Label(filt, text="Filter").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Entry(filt, textvariable=self.as_filter).grid(row=0, column=1, sticky="ew")
+        filter_entry = ttk.Entry(filt, textvariable=self.as_filter)
+        filter_entry.grid(row=0, column=1, sticky="ew")
+        filter_entry.bind("<Return>", lambda _e: self._as_apply_filter())
         ttk.Label(filt, text="Kind").grid(row=0, column=2, sticky="w", padx=(12, 8))
-        ttk.Combobox(
+        self.as_kind_combo = ttk.Combobox(
             filt,
             textvariable=self.as_kind_filter,
             values=KIND_FILTER_VALUES,
             state="readonly",
             width=14,
-        ).grid(row=0, column=3, sticky="w")
-        ttk.Button(filt, text="Apply", command=self._as_apply_filter).grid(
-            row=0, column=4, padx=(8, 0)
         )
-
-        sort_row = ttk.Frame(roots_frame)
-        sort_row.grid(row=3, column=0, columnspan=5, sticky="ew", pady=(8, 0))
-        ttk.Label(sort_row, text="Sort by").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.as_kind_combo.grid(row=0, column=3, sticky="w")
+        self.as_kind_combo.bind("<<ComboboxSelected>>", self._on_as_kind_filter_changed)
+        ttk.Label(filt, text="Sort").grid(row=0, column=4, sticky="w", padx=(12, 8))
         self.as_sort_combo = ttk.Combobox(
-            sort_row,
+            filt,
             textvariable=self.as_sort_label,
             values=list(SRC_SORT_LABELS.values()),
             state="readonly",
-            width=18,
+            width=14,
         )
-        self.as_sort_combo.grid(row=0, column=1, sticky="w")
+        self.as_sort_combo.grid(row=0, column=5, sticky="w")
         self.as_sort_combo.bind("<<ComboboxSelected>>", self._on_as_sort_changed)
         ttk.Checkbutton(
-            sort_row,
-            text="Descending",
+            filt,
+            text="Desc",
             variable=self.as_sort_desc,
             command=self._on_as_sort_changed,
-        ).grid(row=0, column=2, padx=(12, 0), sticky="w")
+        ).grid(row=0, column=6, padx=(8, 0), sticky="w")
+        ttk.Button(filt, text="Apply", command=self._as_apply_filter, width=8).grid(
+            row=0, column=7, padx=(12, 0)
+        )
+        # Force paint: readonly Combobox can stay blank until first focus on some themes.
+        self.as_kind_combo.set(self.as_kind_filter.get() or "all")
+        self.as_sort_combo.set(self.as_sort_label.get())
 
         self.as_status = tk.StringVar(value="No scan yet.")
         ttk.Label(roots_frame, textvariable=self.as_status).grid(
-            row=4, column=0, columnspan=5, sticky="w", pady=(8, 0)
+            row=3, column=0, columnspan=5, sticky="w", pady=(8, 0)
         )
+        self.as_progress = ttk.Progressbar(
+            roots_frame, mode="determinate", maximum=100, value=0
+        )
+        self.as_progress.grid(row=4, column=0, columnspan=5, sticky="ew", pady=(4, 0))
 
         table = ttk.LabelFrame(parent, text="Audio files", padding=6)
         table.pack(fill="both", expand=True, padx=4, pady=4)
@@ -1885,8 +2059,38 @@ class App:
         self._as_kind_edit_item = item
         self._as_kind_edit_path = path
         combo.bind("<<ComboboxSelected>>", self._as_commit_kind_edit)
-        combo.bind("<FocusOut>", self._as_commit_kind_edit)
+        combo.bind("<FocusOut>", self._as_on_kind_focus_out)
         combo.bind("<Escape>", self._as_cancel_kind_edit)
+        # Open on first click: otherwise user must click again to drop the list.
+        combo.after(1, lambda c=combo: self._as_post_kind_combo(c))
+
+    def _as_post_kind_combo(self, combo: ttk.Combobox) -> None:
+        if combo is not self._as_kind_editor:
+            return
+        try:
+            combo.tk.call("ttk::combobox::Post", str(combo))
+        except tk.TclError:
+            try:
+                combo.event_generate("<Down>")
+            except tk.TclError:
+                pass
+
+    def _as_on_kind_focus_out(self, _event: tk.Event | None = None) -> None:
+        # Delay: opening/closing the popdown can briefly steal focus and would
+        # otherwise destroy the editor before a selection registers.
+        self.root.after(180, self._as_commit_kind_if_unfocused)
+
+    def _as_commit_kind_if_unfocused(self) -> None:
+        editor = self._as_kind_editor
+        if editor is None or self._as_kind_committing:
+            return
+        try:
+            focused = self.root.focus_get()
+        except tk.TclError:
+            focused = None
+        if focused is editor:
+            return
+        self._as_commit_kind_edit()
 
     def _as_commit_kind_edit(self, _event: tk.Event | None = None) -> None:
         if self._as_kind_committing:
@@ -1912,6 +2116,11 @@ class App:
                 save_scan_cache(self._db, self._audio_scan_rows)
             except OSError:
                 pass
+            row_after = self._as_row_for_path(path)
+            if row_after is not None and set_kind_for_name(
+                self._shared_catalog, row_after.name, new_kind
+            ):
+                self._persist_shared_catalog()
             vals = list(self.as_tree.item(item, "values"))
             if vals:
                 vals[0] = kind_label(new_kind)
@@ -1927,6 +2136,7 @@ class App:
     def _restore_audio_scan_from_settings(self) -> None:
         self._as_refresh_roots_list()
         self._audio_scan_rows = load_scan_cache(self._db)
+        self._apply_shared_catalog(persist_db=True)
         if self._audio_scan_rows:
             self._as_apply_filter()
             self._refresh_source_list()
@@ -2039,11 +2249,23 @@ class App:
             return
         self._audio_scan_running = True
         self.as_status.set("Scanning…")
+        if hasattr(self, "as_scan_btn"):
+            self.as_scan_btn.config(state="disabled")
+        if hasattr(self, "as_progress"):
+            self.as_progress.stop()
+            self.as_progress.configure(mode="indeterminate")
+            self.as_progress.start(12)
+        self._set_window_progress(0.0)
         roots = list(self.audio_scan_roots)
+
+        def on_progress(done: int, total: int, message: str) -> None:
+            self.root.after(
+                0, lambda d=done, t=total, m=message: self._as_scan_progress(d, t, m)
+            )
 
         def worker() -> None:
             try:
-                rows = scan_audio_roots(roots)
+                rows = scan_audio_roots(roots, on_progress=on_progress)
             except Exception as exc:
                 self.root.after(0, lambda: self._as_scan_failed(str(exc)))
                 return
@@ -2051,18 +2273,52 @@ class App:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _as_scan_progress(self, done: int, total: int, message: str) -> None:
+        if not self._audio_scan_running:
+            return
+        self.as_status.set(message)
+        if not hasattr(self, "as_progress"):
+            return
+        if total > 0:
+            if str(self.as_progress.cget("mode")) != "determinate":
+                self.as_progress.stop()
+                self.as_progress.configure(mode="determinate", maximum=100)
+            pct = 100.0 * done / max(total, 1)
+            self.as_progress["value"] = pct
+            self._set_window_progress(pct)
+        else:
+            # Listing phase — keep indeterminate pulse
+            if str(self.as_progress.cget("mode")) != "indeterminate":
+                self.as_progress.configure(mode="indeterminate")
+                self.as_progress.start(12)
+
+    def _as_scan_finish_ui(self) -> None:
+        if hasattr(self, "as_scan_btn"):
+            self.as_scan_btn.config(state="normal")
+        if hasattr(self, "as_progress"):
+            self.as_progress.stop()
+            self.as_progress.configure(mode="determinate", maximum=100, value=0)
+        self._reset_job_progress()
+
+    def _on_as_kind_filter_changed(self, _event: tk.Event | None = None) -> None:
+        self._as_apply_filter()
+
     def _on_as_sort_changed(self, _event: tk.Event | None = None) -> None:
         self._as_apply_filter()
         self._save_settings()
 
     def _as_scan_failed(self, msg: str) -> None:
         self._audio_scan_running = False
+        self._as_scan_finish_ui()
         self.as_status.set(f"Scan failed: {msg}")
 
     def _as_scan_done(self, rows: list[AudioFileRow]) -> None:
         self._audio_scan_running = False
+        self._as_scan_finish_ui()
         rows = merge_rescan_rows(self._audio_scan_rows, rows)
-        self._set_audio_scan_rows(rows)
+        self._audio_scan_rows = rows
+        self._apply_shared_catalog(persist_db=True)
+        self._set_audio_scan_rows(self._audio_scan_rows)
 
     def _as_apply_filter(self) -> None:
         if not hasattr(self, "as_tree"):
@@ -2118,50 +2374,64 @@ class App:
 
         ttk.Label(
             ctrl,
-            text="Click a Note cell to edit (saved automatically). Double-click other columns to play.",
-            wraplength=900,
-        ).grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 8))
+            text=(
+                "Click Note to edit · click Score stars (1–3) to rate (same star again clears) · "
+                "right-click Auto process = Separate + Convert (current model) · "
+                "double-click other columns to play."
+            ),
+            wraplength=960,
+        ).grid(row=0, column=0, columnspan=6, sticky="w", pady=(0, 8))
 
         filt = ttk.Frame(ctrl)
-        filt.grid(row=1, column=0, columnspan=5, sticky="ew")
+        filt.grid(row=1, column=0, columnspan=6, sticky="ew")
         filt.columnconfigure(1, weight=1)
         ttk.Label(filt, text="Filter").grid(row=0, column=0, sticky="w", padx=(0, 8))
         ttk.Entry(filt, textvariable=self.src_filter).grid(row=0, column=1, sticky="ew")
-        ttk.Button(filt, text="Apply", command=self._refresh_source_list).grid(
-            row=0, column=2, padx=(8, 0)
-        )
-        ttk.Button(filt, text="Refresh", command=self._src_manual_refresh).grid(
-            row=0, column=3, padx=(8, 0)
-        )
-        ttk.Button(filt, text="Play selected", command=self._src_play_selected).grid(
-            row=0, column=4, padx=(8, 0)
-        )
-        ttk.Button(filt, text="Process", command=self._src_go_process, style=BTN_STYLE_PROCESS).grid(
-            row=0, column=5, padx=(8, 0)
-        )
-
-        sort_row = ttk.Frame(ctrl)
-        sort_row.grid(row=2, column=0, columnspan=5, sticky="ew", pady=(8, 0))
-        ttk.Label(sort_row, text="Sort by").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(filt, text="Sort").grid(row=0, column=2, sticky="w", padx=(12, 8))
         self.src_sort_combo = ttk.Combobox(
-            sort_row,
+            filt,
             textvariable=self.src_sort_label,
             values=list(SRC_SORT_LABELS.values()),
             state="readonly",
-            width=18,
+            width=14,
         )
-        self.src_sort_combo.grid(row=0, column=1, sticky="w")
+        self.src_sort_combo.grid(row=0, column=3, sticky="w")
         self.src_sort_combo.bind("<<ComboboxSelected>>", self._on_src_sort_changed)
         ttk.Checkbutton(
-            sort_row,
-            text="Descending",
+            filt,
+            text="Desc",
             variable=self.src_sort_desc,
             command=self._on_src_sort_changed,
-        ).grid(row=0, column=2, padx=(12, 0), sticky="w")
+        ).grid(row=0, column=4, padx=(8, 0), sticky="w")
+        btns = ttk.Frame(filt)
+        btns.grid(row=0, column=5, sticky="e", padx=(12, 0))
+        ttk.Button(btns, text="Apply", command=self._refresh_source_list, width=8).pack(
+            side="left", padx=(0, 4)
+        )
+        ttk.Button(btns, text="Refresh", command=self._src_manual_refresh, width=8).pack(
+            side="left", padx=(0, 4)
+        )
+        ttk.Button(btns, text="Play", command=self._src_play_selected, width=8).pack(
+            side="left", padx=(0, 4)
+        )
+        ttk.Button(
+            btns, text="Process", command=self._src_go_process, style=BTN_STYLE_PROCESS, width=9
+        ).pack(side="left")
+
+        score_row = ttk.Frame(ctrl)
+        score_row.grid(row=2, column=0, columnspan=6, sticky="w", pady=(8, 0))
+        ttk.Label(score_row, text="Score").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        for i, var in enumerate(self.src_score_filters):
+            ttk.Checkbutton(
+                score_row,
+                text=format_score_stars(i),
+                variable=var,
+                command=self._on_src_score_filter_changed,
+            ).grid(row=0, column=i + 1, sticky="w", padx=(0, 10))
 
         self.src_status = tk.StringVar(value="No source files yet.")
         ttk.Label(ctrl, textvariable=self.src_status).grid(
-            row=3, column=0, columnspan=5, sticky="w", pady=(8, 0)
+            row=3, column=0, columnspan=6, sticky="w", pady=(8, 0)
         )
 
         table = ttk.LabelFrame(parent, text="Source audio", padding=6)
@@ -2172,15 +2442,16 @@ class App:
         headings = {
             "name": "File",
             "size": "Size",
-            "duration": "Duration",
+            "duration": "Dur",
             "note": "Note",
+            "score": "Score",
             "converted": "Cvt",
             "path": "Full path",
         }
         for key, label in headings.items():
             self.src_tree.heading(key, text=label)
             width = self._src_tree_col_widths.get(key, SRC_TREE_COL_DEFAULTS[key])
-            anchor = "center" if key in ("note", "converted", "duration") else "w"
+            anchor = "center" if key in ("score", "converted", "duration", "size") else "w"
             self.src_tree.column(
                 key,
                 width=width,
@@ -2226,12 +2497,37 @@ class App:
             command=self._src_process_context_item,
         )
         self._src_context_menu.add_command(
+            label="Auto process",
+            command=self._src_auto_process_context_item,
+        )
+        self._src_context_menu.add_command(
             label="Show in Audio Scan",
             command=self._src_show_in_audio_scan,
         )
         self._src_context_menu.add_command(
+            label="Show in Convert",
+            command=self._src_show_in_convert,
+        )
+        self._src_context_menu.add_command(
             label="Show in Explorer",
             command=self._src_show_context_path_in_explorer,
+        )
+        self._src_context_menu.add_separator()
+        self._src_context_menu.add_command(
+            label="Score ★☆☆ (1)",
+            command=lambda: self._src_set_context_score(1),
+        )
+        self._src_context_menu.add_command(
+            label="Score ★★☆ (2)",
+            command=lambda: self._src_set_context_score(2),
+        )
+        self._src_context_menu.add_command(
+            label="Score ★★★ (3)",
+            command=lambda: self._src_set_context_score(3),
+        )
+        self._src_context_menu.add_command(
+            label="Clear score",
+            command=lambda: self._src_set_context_score(0),
         )
 
     @staticmethod
@@ -2329,14 +2625,17 @@ class App:
     def _src_note_column_id(self) -> str:
         return "#4"
 
+    def _src_score_column_id(self) -> str:
+        return "#5"
+
     def _src_path_column_id(self) -> str:
-        return "#6"
+        return "#7"
 
     def _src_path_from_item(self, item: str) -> str | None:
         vals = self.src_tree.item(item, "values")
-        if not vals or len(vals) < 6:
+        if not vals or len(vals) < 7:
             return None
-        path = str(vals[5]).strip()
+        path = str(vals[6]).strip()
         if not path or not Path(path).is_file():
             return None
         return path
@@ -2370,6 +2669,82 @@ class App:
             return
         self._src_go_process_path(path)
 
+    def _src_auto_process_context_item(self) -> None:
+        path = self._src_context_reveal_path or self._src_selected_path()
+        if not path:
+            return
+        self._src_auto_process_path(path)
+
+    def _src_auto_process_path(self, path: str) -> None:
+        """Separate (if needed) then Convert with the currently selected model."""
+        if self.running:
+            messagebox.showwarning("Busy", "Wait for the current job to finish, or Stop it.")
+            return
+        if not path or not Path(path).is_file():
+            messagebox.showinfo("Auto process", "Select a valid source file first.")
+            return
+        model_path = self.im_model_path.get().strip()
+        if not model_path or not Path(model_path).is_file():
+            messagebox.showerror(
+                "Auto process",
+                "Select a valid .pth model on the Convert tab first.",
+            )
+            return
+        if not self.im_merge_output_dir.get().strip():
+            messagebox.showerror(
+                "Auto process",
+                "Set merge_output_dir on the Convert tab first.",
+            )
+            return
+        if self._require_rvc_root() is None:
+            return
+
+        self._process_source_path = path
+        self._set_convert_context_for_source(path)
+        vocals, inst = self._resolve_stems_for_source(path)
+        self._process_vocals_path = vocals
+        self._process_inst_path = inst
+        self._refresh_process_tab()
+
+        if vocals and inst and Path(vocals).is_file() and Path(inst).is_file():
+            self.log_queue.put(
+                f"[auto process] stems already present — skip separate\n"
+                f"  vocals: {vocals}\n  instrumental: {inst}\n"
+            )
+            self._set_convert_context_for_source(path, vocals=vocals, inst=inst)
+            self.notebook.select(TAB_CONVERT)
+            self.run_convert()
+            return
+
+        out = str(Path(path).parent)
+        self.log_queue.put(f"[auto process] separate then convert: {path}\n")
+        self.notebook.select(TAB_PROCESS)
+
+        def after_separate() -> None:
+            self._refresh_process_tab()
+            v = self._process_vocals_path
+            i = self._process_inst_path
+            if not v or not i or not Path(v).is_file() or not Path(i).is_file():
+                self._set_running(False)
+                messagebox.showerror(
+                    "Auto process",
+                    "Separate finished but vocals/instrumental stems were not found.",
+                )
+                return
+            self._set_convert_context_for_source(path, vocals=v, inst=i)
+            self.notebook.select(TAB_CONVERT)
+            # Separate kept running=True (release_running=False); chain into Convert.
+            self.run_convert(chain=True)
+
+        self.run_separate(
+            inp=path,
+            out=out,
+            quiet=True,
+            fill_infer_merge=True,
+            release_running=False,
+            on_success=after_separate,
+        )
+
     def _src_show_in_audio_scan(self) -> None:
         path = self._src_context_reveal_path or self._src_selected_path()
         if not path:
@@ -2381,6 +2756,13 @@ class App:
             )
             return
         self.notebook.select(TAB_AUDIO_SCAN)
+
+    def _src_show_in_convert(self) -> None:
+        path = self._src_context_reveal_path or self._src_selected_path()
+        if not path:
+            return
+        self._set_convert_context_for_source(path)
+        self.notebook.select(TAB_CONVERT)
 
     def _as_focus_path(self, path: str) -> bool:
         from audio_kind import kind_matches_filter
@@ -2490,8 +2872,10 @@ class App:
             note = editor.get()
             if set_source_note(self._stem_links, path, note):
                 self._persist_stem_links()
+                if set_note_for_stem(self._shared_catalog, path, note):
+                    self._persist_shared_catalog()
             vals = list(self.src_tree.item(item, "values"))
-            if len(vals) >= 6:
+            if len(vals) >= 7:
                 vals[3] = note
                 self.src_tree.item(item, values=vals)
         finally:
@@ -2501,21 +2885,68 @@ class App:
     def _src_cancel_note_edit(self, _event: tk.Event | None = None) -> None:
         self._src_destroy_note_editor()
 
+    def _src_set_score(self, path: str, score: int, *, item: str | None = None) -> None:
+        if not path:
+            return
+        if not set_source_score(self._stem_links, path, score):
+            return
+        self._persist_stem_links()
+        if set_score_for_stem(self._shared_catalog, path, score):
+            self._persist_shared_catalog()
+        self._invalidate_source_display_cache()
+        stars = format_score_stars(score)
+        if item and self.src_tree.exists(item):
+            vals = list(self.src_tree.item(item, "values"))
+            if len(vals) >= 7:
+                vals[4] = stars
+                self.src_tree.item(item, values=vals)
+        else:
+            self._refresh_source_list(sort_only=True)
+
+    def _src_set_context_score(self, score: int) -> None:
+        path = self._src_context_reveal_path or self._src_selected_path()
+        if not path:
+            return
+        item = None
+        sel = self.src_tree.selection()
+        if sel:
+            item = sel[0]
+        self._src_set_score(path, score, item=item)
+
     def _src_on_tree_click(self, event: tk.Event) -> None:
         if self.src_tree.identify_region(event.x, event.y) != "cell":
             return
-        if self.src_tree.identify_column(event.x) != self._src_note_column_id():
-            return
+        col = self.src_tree.identify_column(event.x)
         item = self.src_tree.identify_row(event.y)
-        if item:
+        if not item:
+            return
+        if col == self._src_note_column_id():
             self.root.after_idle(lambda i=item: self._src_begin_note_edit(i))
+            return
+        if col == self._src_score_column_id():
+            path = self._src_path_from_item(item)
+            if not path:
+                return
+            bbox = self.src_tree.bbox(item, column="score")
+            if not bbox:
+                return
+            x, _y, w, _h = bbox
+            clicked = score_from_click_x(event.x - x, w)
+            cur = get_source_score(path, self._stem_links)
+            new_score = 0 if clicked == cur else clicked
+            self._src_set_score(path, new_score, item=item)
 
     def _src_on_tree_double_click(self, event: tk.Event) -> None:
-        if self.src_tree.identify_column(event.x) == self._src_note_column_id():
+        col = self.src_tree.identify_column(event.x)
+        if col in (self._src_note_column_id(), self._src_score_column_id()):
             return
         self._src_play_selected()
 
     def _on_src_sort_changed(self, _event: tk.Event | None = None) -> None:
+        self._refresh_source_list(sort_only=True)
+        self._save_settings()
+
+    def _on_src_score_filter_changed(self) -> None:
         self._refresh_source_list(sort_only=True)
         self._save_settings()
 
@@ -2577,17 +3008,32 @@ class App:
             self._src_display_cache_key = cache_key
             self._src_display_cache_payload = payload
 
-        sorted_rows = sort_rows(
-            [item[0] for item in payload],
-            sort_key_from_label(self.src_sort_label.get()),
-            descending=bool(self.src_sort_desc.get()),
-        )
-        by_path = {item[0].path: item for item in payload}
-        for r in sorted_rows:
-            item = by_path.get(r.path)
-            if item is None:
-                continue
-            row, note, cvt_n = item
+        score_sel = self._src_selected_scores()
+        if score_sel is not None:
+            payload = [item for item in payload if item[3] in score_sel]
+
+        sort_by = sort_key_from_label(self.src_sort_label.get())
+        descending = bool(self.src_sort_desc.get())
+        if sort_by == "score":
+            ordered = sorted(
+                payload,
+                key=lambda it: (it[3], it[0].name.lower()),
+                reverse=descending,
+            )
+        else:
+            sorted_rows = sort_rows(
+                [item[0] for item in payload],
+                sort_by,
+                descending=descending,
+            )
+            by_path = {item[0].path: item for item in payload}
+            ordered = []
+            for r in sorted_rows:
+                item = by_path.get(r.path)
+                if item is not None:
+                    ordered.append(item)
+
+        for row, note, cvt_n, score in ordered:
             self.src_tree.insert(
                 "",
                 tk.END,
@@ -2596,13 +3042,15 @@ class App:
                     format_size(row.size_bytes),
                     format_duration(row.duration_sec),
                     note,
+                    format_score_stars(score),
                     str(cvt_n),
                     row.path,
                 ),
             )
-        total_bytes = sum(r.size_bytes for r in rows)
+        total_bytes = sum(item[0].size_bytes for item in ordered)
+        scored = sum(1 for _r, _n, _c, sc in ordered if sc > 0)
         self.src_status.set(
-            f"source files={len(rows)}  total={format_size(total_bytes)}"
+            f"showing={len(ordered)}  scored={scored}  total={format_size(total_bytes)}"
         )
 
     # ---- Tab 3: Process ----
@@ -2890,6 +3338,7 @@ class App:
         on_success: Callable[[], None] | None = None,
         quiet: bool = False,
         fill_infer_merge: bool | None = None,
+        release_running: bool = True,
     ) -> None:
         inp = (inp or self.sep_input_path.get()).strip()
         out = (out or self.sep_output_dir.get()).strip()
@@ -2983,6 +3432,7 @@ class App:
             cwd=PACKAGE_DIR,
             env=env,
             on_success=on_done,
+            release_running=release_running,
         )
 
     def _maybe_fill_infer_merge_from_sep(self, out_dir: str) -> None:
@@ -3813,27 +4263,37 @@ class App:
         ]
         return cmd, infer_result, merge_out
 
-    def run_convert(self) -> None:
+    def run_convert(self, *, chain: bool = False) -> None:
         root = self._require_rvc_root()
         if root is None:
+            if chain:
+                self._set_running(False)
             return
         built = self._build_infer_cmd(root)
         if built is None:
+            if chain:
+                self._set_running(False)
             return
         infer_cmd, opt_path, env_extra = built
         convert_source = self._resolve_convert_source()
         bgm_path = self._resolve_bgm_path()
         if not bgm_path:
+            if chain:
+                self._set_running(False)
             messagebox.showerror(
                 "Missing instrumental",
                 "Instrumental stem not found.\nRun Separate on the Process tab first.",
             )
             return
         if not self.im_merge_output_dir.get().strip():
+            if chain:
+                self._set_running(False)
             messagebox.showerror("Missing output", "Select a valid merge_output_dir.")
             return
         self._refresh_im_merge_output_path()
         if not self.im_merge_output_path.get().strip():
+            if chain:
+                self._set_running(False)
             messagebox.showerror("Missing output", "merge_output_path is empty.")
             return
 
@@ -3841,6 +4301,7 @@ class App:
             self._refresh_im_merge_output_path()
             merge_built = self._build_merge_cmd(bgm_path)
             if merge_built is None:
+                self._set_running(False)
                 messagebox.showerror(
                     "Convert",
                     f"Infer finished but merge could not start.\nOutput:\n{opt_path}",
@@ -3877,6 +4338,7 @@ class App:
             root,
             on_success=after_infer,
             env_extra=env_extra,
+            chain=chain,
             release_running=False,
         )
 

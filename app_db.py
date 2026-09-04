@@ -11,7 +11,7 @@ from typing import Any, Iterator
 from rvc_env import PACKAGE_DIR
 
 DB_PATH = PACKAGE_DIR / "rvc_gui.db"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _LEGACY_SETTINGS = PACKAGE_DIR / "settings.json"
 _LEGACY_STEM_LINKS = PACKAGE_DIR / "stem_links.json"
@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS source_link (
     vocals_path        TEXT,
     instrumental_path  TEXT,
     note               TEXT,
+    score              INTEGER NOT NULL DEFAULT 0,
     updated_ns         INTEGER NOT NULL DEFAULT 0
 );
 
@@ -131,6 +132,12 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     if "duration_sec" not in cols:
         conn.execute(
             "ALTER TABLE audio_scan_row ADD COLUMN duration_sec REAL NOT NULL DEFAULT 0"
+        )
+        conn.commit()
+    link_cols = {row[1] for row in conn.execute("PRAGMA table_info(source_link)")}
+    if "score" not in link_cols:
+        conn.execute(
+            "ALTER TABLE source_link ADD COLUMN score INTEGER NOT NULL DEFAULT 0"
         )
         conn.commit()
     ver = schema_version(conn)
@@ -245,6 +252,7 @@ def load_stem_links_db(conn: sqlite3.Connection) -> dict[str, Any]:
             instrumental=row["instrumental_path"],
             convert_results=results or None,
             note=row["note"],
+            score=int(row["score"] or 0) if "score" in row.keys() else 0,
             updated_ns=int(row["updated_ns"] or 0),
         )
     return out
@@ -262,14 +270,15 @@ def save_stem_links_db(conn: sqlite3.Connection, links: dict[str, Any]) -> None:
             conn.execute(
                 """
                 INSERT INTO source_link(
-                    source_path, vocals_path, instrumental_path, note, updated_ns
-                ) VALUES (?, ?, ?, ?, ?)
+                    source_path, vocals_path, instrumental_path, note, score, updated_ns
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(key),
                     link.vocals,
                     link.instrumental,
                     link.note,
+                    int(getattr(link, "score", 0) or 0),
                     int(link.updated_ns or time.time_ns()),
                 ),
             )
@@ -382,6 +391,7 @@ def migrate_legacy_json(conn: sqlite3.Connection, db_path: Path | None = None) -
                         instrumental=item.get("instrumental") or None,
                         convert_results=convert_results,
                         note=item.get("note") or None,
+                        score=int(item.get("score") or 0),
                         updated_ns=int(item.get("updated_ns") or 0),
                     )
                 if links:

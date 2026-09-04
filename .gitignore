@@ -7,6 +7,7 @@ rvc_gui.db
 settings.json
 audio_scan_cache.json
 stem_links.json
+# shared_catalog.json IS tracked (portable notes + kind overrides)
 
 # Python
 __pycache__/

@@ -42,6 +42,8 @@ or:
 
 On first launch, configure **Settings → RVC root**. Paths and options are saved to local `rvc_gui.db` (SQLite, gitignored). Existing `settings.json` / `stem_links.json` / `audio_scan_cache.json` are imported automatically on first run.
 
+**Shared catalog (versioned):** `shared_catalog.json` stores portable **notes** and **scores** (keyed by filename stem) plus **kind overrides** (keyed by filename). Click Score stars in Source Audio (1–3; click same again to clear). Use **Settings → Shared catalog → Export / Import**, or edit notes/kinds/scores in the GUI (auto-updates the file). Commit `shared_catalog.json` to share triage; keep `rvc_gui.db` local.
+
 ## Separate tab (audio-separator)
 
 Uses a dedicated venv under this package (not the RVC runtime), plus checkpoints in `models/`.
