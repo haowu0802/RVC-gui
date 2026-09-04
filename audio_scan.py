@@ -9,7 +9,14 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from audio_kind import KIND_DISPLAY, classify_audio_kind, kind_label, kind_matches_filter, normalize_kind
+from audio_kind import (
+    KIND_DISPLAY,
+    KIND_SOURCE,
+    classify_audio_kind,
+    kind_label,
+    kind_matches_filter,
+    normalize_kind,
+)
 
 AUDIO_EXTS = {".wav", ".flac", ".mp3", ".m4a", ".ogg", ".aac"}
 
@@ -377,7 +384,11 @@ def merge_rescan_rows(
     existing: list[AudioFileRow],
     scanned: list[AudioFileRow],
 ) -> list[AudioFileRow]:
-    """Keep user-edited kind/duration when rescanning known paths."""
+    """Keep probed duration when rescanning known paths.
+
+    Kind always comes from the fresh scan heuristics. Manual kind overrides are
+    re-applied afterward from ``shared_catalog.json`` (see GUI scan done).
+    """
     by_path = {_path_key(r.path): r for r in existing}
     out: list[AudioFileRow] = []
     for row in scanned:
@@ -386,8 +397,20 @@ def merge_rescan_rows(
             out.append(row)
             continue
         duration = prev.duration_sec if prev.duration_sec > 0 else row.duration_sec
-        out.append(replace(row, kind=prev.kind, duration_sec=duration))
+        out.append(replace(row, duration_sec=duration))
     return out
+
+
+def reconcile_row_kind(row: AudioFileRow) -> AudioFileRow:
+    """Upgrade stale ``source`` kinds when filename heuristics say otherwise."""
+    auto = classify_audio_kind(row.name, row.rel_path)
+    if normalize_kind(row.kind) == KIND_SOURCE and auto != KIND_SOURCE:
+        return replace(row, kind=auto)
+    return row
+
+
+def reconcile_auto_kinds(rows: list[AudioFileRow]) -> list[AudioFileRow]:
+    return [reconcile_row_kind(r) for r in rows]
 
 
 def update_row_kind(rows: list[AudioFileRow], path: str, kind: str) -> list[AudioFileRow]:
@@ -405,7 +428,7 @@ def load_scan_cache(
     from app_db import load_scan_cache_db, resolve_conn
 
     conn = resolve_conn(db_or_path)
-    return load_scan_cache_db(conn)
+    return reconcile_auto_kinds(load_scan_cache_db(conn))
 
 
 def save_scan_cache(

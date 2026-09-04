@@ -4,12 +4,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from audio_scan import AUDIO_EXTS, AudioFileRow
+from audio_kind import is_convert_result_name
 from source_match import stem_key
 from stem_links import StemLink, get_convert_results, source_key, valid_audio_path
-
-
-def is_convert_result_name(name: str) -> bool:
-    return "(merged)" in name.lower()
 
 
 def convert_result_matches_source(result_path: str, source_path: str) -> bool:

@@ -76,6 +76,11 @@ def _in_clone_output_dir(path_low: str) -> bool:
     return False
 
 
+def is_convert_result_name(name: str) -> bool:
+    """True for Convert/merge outputs (GUI names files with ``(Merged)``)."""
+    return "(merged)" in (name or "").lower()
+
+
 def classify_audio_kind(name: str, rel_path: str = "") -> str:
     """Classify a file as source / vocal / instrumental / result / other."""
     low = name.lower()
@@ -85,6 +90,9 @@ def classify_audio_kind(name: str, rel_path: str = "") -> str:
         return KIND_SOURCE
 
     if _in_clone_output_dir(path_low):
+        return KIND_RESULT
+
+    if is_convert_result_name(name):
         return KIND_RESULT
 
     if "(dfn3)" in low:

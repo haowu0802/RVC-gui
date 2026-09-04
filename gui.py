@@ -219,6 +219,8 @@ def _apply_theme(root: tk.Tk, light: bool) -> dict[str, str]:
             "log_bg": "#ffffff",
             "log_fg": "#1a1a1a",
             "disabled": "#888888",
+            "converted_bg": "#d8f0d8",
+            "converted_fg": "#0d3d0d",
         }
     else:
         colors = {
@@ -232,6 +234,8 @@ def _apply_theme(root: tk.Tk, light: bool) -> dict[str, str]:
             "log_bg": "#1e1e1e",
             "log_fg": "#d4d4d4",
             "disabled": "#777777",
+            "converted_bg": "#1e3d28",
+            "converted_fg": "#b8f0c0",
         }
 
     root.configure(bg=colors["bg"])
@@ -277,6 +281,25 @@ def _apply_theme(root: tk.Tk, light: bool) -> dict[str, str]:
         background=colors["button"],
         troughcolor=colors["bg"],
         arrowcolor=colors["fg"],
+    )
+    style.configure(
+        "Horizontal.TScrollbar",
+        background=colors["button"],
+        troughcolor=colors["bg"],
+        arrowcolor=colors["fg"],
+    )
+    style.configure(
+        "TProgressbar",
+        background=colors["select"],
+        troughcolor=colors["button"],
+        bordercolor=colors["border"],
+        lightcolor=colors["select"],
+        darkcolor=colors["select"],
+    )
+    style.configure(
+        "Horizontal.TScale",
+        background=colors["bg"],
+        troughcolor=colors["button"],
     )
     style.configure("TSeparator", background=colors["border"])
     # Treeview: clam defaults to light field colors; force theme-aware contrast.
@@ -336,6 +359,7 @@ def _apply_theme(root: tk.Tk, light: bool) -> dict[str, str]:
 BTN_STYLE_PROCESS = "Process.TButton"
 BTN_STYLE_SEPARATE = "Separate.TButton"
 BTN_STYLE_CONVERT = "Convert.TButton"
+BTN_STYLE_SCAN = "Scan.TButton"
 
 
 def _action_button_font() -> tuple[str, int, str]:
@@ -352,6 +376,7 @@ def _configure_action_button_styles(style: ttk.Style, light: bool) -> None:
             BTN_STYLE_PROCESS: ("#2563eb", "#ffffff", "#1d4ed8", "#93c5fd"),
             BTN_STYLE_SEPARATE: ("#ea580c", "#ffffff", "#c2410c", "#fdba74"),
             BTN_STYLE_CONVERT: ("#059669", "#ffffff", "#047857", "#6ee7b7"),
+            BTN_STYLE_SCAN: ("#7c3aed", "#ffffff", "#6d28d9", "#c4b5fd"),
         }
         disabled_bg = "#c8c8c8"
         disabled_fg = "#888888"
@@ -360,6 +385,7 @@ def _configure_action_button_styles(style: ttk.Style, light: bool) -> None:
             BTN_STYLE_PROCESS: ("#3b82f6", "#ffffff", "#2563eb", "#60a5fa"),
             BTN_STYLE_SEPARATE: ("#f97316", "#ffffff", "#ea580c", "#fb923c"),
             BTN_STYLE_CONVERT: ("#10b981", "#ffffff", "#059669", "#34d399"),
+            BTN_STYLE_SCAN: ("#8b5cf6", "#ffffff", "#7c3aed", "#a78bfa"),
         }
         disabled_bg = "#4a4a4a"
         disabled_fg = "#9a9a9a"
@@ -451,6 +477,7 @@ class App:
         self._playback_after_id: str | None = None
         self._pb_ignore_seek = False
         self._pb_seeking = False
+        self._wrap_labels: list[tuple[tk.Misc, float]] = []
         self._job_pct: float | None = None
         self._job_total_epoch: int | None = None
         self._job_audio_duration: float | None = None
@@ -553,7 +580,7 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(80, self._drain_log_queue)
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
-        self._update_global_start_state()
+        self.root.after_idle(self._refresh_wraplengths)
 
     def _invalidate_source_display_cache(self) -> None:
         self._src_display_cache_key = None
@@ -1218,6 +1245,7 @@ class App:
     def _on_root_configure(self, event: tk.Event) -> None:
         if event.widget is not self.root:
             return
+        self._refresh_wraplengths(event.width)
         if self._suppress_autosave:
             return
         if self._geometry_save_after_id is not None:
@@ -1226,6 +1254,24 @@ class App:
             except tk.TclError:
                 pass
         self._geometry_save_after_id = self.root.after(500, self._save_geometry_debounced)
+
+    def _register_wrap_label(self, label: tk.Misc, *, fraction: float = 0.85) -> None:
+        self._wrap_labels.append((label, max(0.25, min(0.95, fraction))))
+
+    def _refresh_wraplengths(self, width: int | None = None) -> None:
+        if not hasattr(self, "_wrap_labels"):
+            return
+        if width is None or width <= 1:
+            try:
+                width = int(self.root.winfo_width())
+            except tk.TclError:
+                return
+        usable = max(360, width - 64)
+        for label, fraction in self._wrap_labels:
+            try:
+                label.configure(wraplength=int(usable * fraction))
+            except tk.TclError:
+                pass
 
     def _save_geometry_debounced(self) -> None:
         self._geometry_save_after_id = None
@@ -1304,16 +1350,16 @@ class App:
         self._build_global_playback(self._bottom_dock)
 
         ctrl = ttk.Frame(self._bottom_dock)
-        ctrl.pack(fill="x", pady=(8, 0))
+        ctrl.pack(fill="x", pady=(6, 0))
 
-        self.start_btn = ttk.Button(ctrl, text="Start", command=self.start_current_tab)
-        self.start_btn.pack(side="left")
-        self.stop_btn = ttk.Button(ctrl, text="Stop", command=self.stop_job, state="disabled")
-        self.stop_btn.pack(side="left", padx=(8, 0))
+        self.stop_btn = ttk.Button(
+            ctrl, text="Stop job", command=self.stop_job, state="disabled"
+        )
+        self.stop_btn.pack(side="left")
         ttk.Label(ctrl, textvariable=self.status_var).pack(side="left", padx=(16, 0))
 
         self._log_section = ttk.Frame(self._bottom_dock)
-        self._log_section.pack(fill="x", pady=(8, 0))
+        self._log_section.pack(fill="x", pady=(6, 0))
 
         log_hdr = ttk.Frame(self._log_section)
         log_hdr.pack(fill="x")
@@ -1330,7 +1376,7 @@ class App:
         log_inner.pack(fill="x")
         self.log_text = tk.Text(
             log_inner,
-            height=12,
+            height=8,
             wrap="word",
             bg=self.colors["log_bg"],
             fg=self.colors["log_fg"],
@@ -1347,20 +1393,28 @@ class App:
         self.notebook = ttk.Notebook(outer)
         self.notebook.pack(fill="both", expand=True)
 
-        self._tab_frames: list[ScrollableFrame] = []
+        # List tabs: plain frame so the Treeview can fill remaining height.
+        # Form tabs: ScrollableFrame for long content.
+        self._tab_frames: list[ttk.Frame] = []
         builders = [
-            self._build_tab_settings,
-            self._build_tab_audio_scan,
-            self._build_tab_source_audio,
-            self._build_tab_process,
-            self._build_tab_separate,
-            self._build_tab_convert,
+            (TAB_NAMES[0], self._build_tab_settings, True),
+            (TAB_NAMES[1], self._build_tab_audio_scan, False),
+            (TAB_NAMES[2], self._build_tab_source_audio, False),
+            (TAB_NAMES[3], self._build_tab_process, True),
+            (TAB_NAMES[4], self._build_tab_separate, True),
+            (TAB_NAMES[5], self._build_tab_convert, True),
         ]
-        for name, builder in zip(TAB_NAMES, builders):
-            sf = ScrollableFrame(self.notebook, bg=self.colors["bg"])
-            self.notebook.add(sf, text=name)
-            self._tab_frames.append(sf)
-            builder(sf.inner)
+        for name, builder, scrollable in builders:
+            if scrollable:
+                sf = ScrollableFrame(self.notebook, bg=self.colors["bg"])
+                self.notebook.add(sf, text=name)
+                self._tab_frames.append(sf)
+                builder(sf.inner)
+            else:
+                frame = ttk.Frame(self.notebook)
+                self.notebook.add(frame, text=name)
+                self._tab_frames.append(frame)
+                builder(frame)
 
     def _toggle_log_panel(self) -> None:
         self._log_collapsed = not self._log_collapsed
@@ -1466,17 +1520,18 @@ class App:
         frame.columnconfigure(3, weight=1)
 
     def _build_global_playback(self, parent: ttk.Frame) -> None:
-        play = ttk.LabelFrame(parent, text="Playback", padding=10)
-        play.pack(fill="x", pady=(8, 0))
+        play = ttk.LabelFrame(parent, text="Playback", padding=8)
+        play.pack(fill="x", pady=(6, 0))
         play.columnconfigure(0, weight=1)
 
         self.pb_now_playing = tk.StringVar(value="(no selection)")
-        ttk.Label(play, textvariable=self.pb_now_playing, wraplength=900).grid(
-            row=0, column=0, columnspan=4, sticky="w"
-        )
+        self.pb_now_playing_full = ""
+        now_lbl = ttk.Label(play, textvariable=self.pb_now_playing)
+        now_lbl.grid(row=0, column=0, columnspan=4, sticky="w")
+        self._register_wrap_label(now_lbl, fraction=0.9)
 
         progress_row = ttk.Frame(play)
-        progress_row.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(8, 4))
+        progress_row.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(6, 2))
         progress_row.columnconfigure(1, weight=1)
         self.pb_time_var = tk.StringVar(value="0:00 / 0:00")
         ttk.Label(progress_row, textvariable=self.pb_time_var, width=14).grid(
@@ -1494,11 +1549,13 @@ class App:
         self.pb_seek.bind("<ButtonRelease-1>", self._on_playback_seek_release)
 
         ctrl = ttk.Frame(play)
-        ctrl.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(4, 0))
+        ctrl.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(2, 0))
         ctrl.columnconfigure(3, weight=1)
         self.pb_play_btn = ttk.Button(ctrl, text="Play", command=self._playback_toggle_pause)
         self.pb_play_btn.grid(row=0, column=0, padx=(0, 8))
-        ttk.Button(ctrl, text="Stop", command=self._playback_stop).grid(row=0, column=1, padx=(0, 16))
+        ttk.Button(ctrl, text="Stop play", command=self._playback_stop).grid(
+            row=0, column=1, padx=(0, 16)
+        )
         ttk.Label(ctrl, text="Volume").grid(row=0, column=2, padx=(0, 8))
         vol = ttk.Scale(
             ctrl,
@@ -1511,7 +1568,7 @@ class App:
         vol.grid(row=0, column=3, sticky="ew", padx=(0, 16))
         ttk.Label(ctrl, text="Output").grid(row=0, column=4, padx=(0, 8))
         self.pb_device_combo = ttk.Combobox(
-            ctrl, textvariable=self.pb_device, width=36, state="readonly"
+            ctrl, textvariable=self.pb_device, width=28, state="readonly"
         )
         self.pb_device_combo.grid(row=0, column=5, sticky="ew")
         self.pb_device_combo.bind("<<ComboboxSelected>>", self._on_playback_device_changed)
@@ -1586,15 +1643,23 @@ class App:
                 pass
             self._playback_after_id = None
 
+    def _set_now_playing_display(self, path: str | None) -> None:
+        if not path:
+            self.pb_now_playing_full = ""
+            self.pb_now_playing.set("(no selection)")
+            return
+        self.pb_now_playing_full = str(path)
+        self.pb_now_playing.set(Path(path).name)
+
     def _update_playback_ui(self) -> None:
         if not hasattr(self, "pb_play_btn"):
             return
         player = self._player
         state = player.state()
         if player.path is not None:
-            self.pb_now_playing.set(str(player.path))
+            self._set_now_playing_display(str(player.path))
         else:
-            self.pb_now_playing.set("(no selection)")
+            self._set_now_playing_display(None)
         if state == "paused":
             self.pb_play_btn.config(text="Resume")
         elif state == "playing":
@@ -1648,7 +1713,7 @@ class App:
             except PlaybackError:
                 messagebox.showerror("Playback error", str(exc))
                 return
-        self.pb_now_playing.set(str(played))
+        self._set_now_playing_display(str(played))
         self._playback_cancel_tick()
         self._update_playback_ui()
         self._playback_after_id = self.root.after(200, self._playback_tick)
@@ -1688,9 +1753,9 @@ class App:
             "Set RVC root before running jobs. You can also export RVC_ROOT in the environment; "
             "the Settings path takes priority when set. Scripts run with cwd = RVC root."
         )
-        ttk.Label(f, text=note, wraplength=900, justify="left").grid(
-            row=2, column=0, columnspan=5, sticky="w", pady=(8, 0)
-        )
+        note_lbl = ttk.Label(f, text=note, justify="left")
+        note_lbl.grid(row=2, column=0, columnspan=5, sticky="w", pady=(8, 0))
+        self._register_wrap_label(note_lbl, fraction=0.85)
 
         exp = ttk.LabelFrame(parent, text="Active experiment", padding=10)
         exp.pack(fill="x", padx=4, pady=4)
@@ -1719,20 +1784,14 @@ class App:
         )
         self.fav_exp_combo.grid(row=1, column=1, columnspan=2, sticky="ew", pady=4)
         self.fav_exp_combo.bind("<<ComboboxSelected>>", self._apply_favorite_experiment)
-        ttk.Button(exp, text="Apply favorite", command=self._apply_favorite_experiment).grid(
-            row=1, column=3, columnspan=2, sticky="e", pady=4, padx=2
-        )
 
-        ttk.Label(
+        exp_note = ttk.Label(
             exp,
-            text=(
-                "Browse logs/<exp_name> (e.g. logs/cx_20260802). "
-                "★ Fav saves it to Favorites for quick switch. "
-                "Fills Exp fields on all tabs and locks them until Clear."
-            ),
-            wraplength=900,
+            text="Browse logs/<exp_name>. ★ Fav saves to Favorites; fills Exp fields until Clear.",
             justify="left",
-        ).grid(row=2, column=0, columnspan=5, sticky="w", pady=(8, 0))
+        )
+        exp_note.grid(row=2, column=0, columnspan=5, sticky="w", pady=(8, 0))
+        self._register_wrap_label(exp_note, fraction=0.85)
 
         sep = ttk.LabelFrame(parent, text="Audio separator (Separate tab)", padding=10)
         sep.pack(fill="x", padx=4, pady=4)
@@ -1745,15 +1804,16 @@ class App:
         ttk.Entry(sep, textvariable=self.sep_proxy).grid(
             row=2, column=1, columnspan=3, sticky="ew", pady=4
         )
-        ttk.Label(
+        sep_note = ttk.Label(
             sep,
             text=(
                 f"Defaults: venv={DEFAULT_SEP_VENV}  models={DEFAULT_SEP_MODEL_DIR}. "
                 "Run setup_separator.ps1 if audio-separator is missing."
             ),
-            wraplength=900,
             justify="left",
-        ).grid(row=3, column=0, columnspan=5, sticky="w", pady=(8, 0))
+        )
+        sep_note.grid(row=3, column=0, columnspan=5, sticky="w", pady=(8, 0))
+        self._register_wrap_label(sep_note, fraction=0.85)
 
         shared = ttk.LabelFrame(parent, text="Shared catalog (git)", padding=10)
         shared.pack(fill="x", padx=4, pady=4)
@@ -1775,21 +1835,20 @@ class App:
             text="Import catalog → DB",
             command=self._on_import_shared_catalog,
         ).pack(side="left", padx=(0, 8))
-        ttk.Label(
+        shared_note = ttk.Label(
             shared,
             text=(
-                "Portable: notes/scores keyed by filename stem; kinds keyed by filename. "
-                "Commit shared_catalog.json to version triage across machines."
+                "Portable: notes/scores by stem; kinds by filename. "
+                "Commit shared_catalog.json to share triage."
             ),
-            wraplength=900,
             justify="left",
-        ).grid(row=2, column=0, columnspan=5, sticky="w", pady=(8, 0))
+        )
+        shared_note.grid(row=2, column=0, columnspan=5, sticky="w", pady=(8, 0))
+        self._register_wrap_label(shared_note, fraction=0.85)
 
-        ttk.Label(
-            parent,
-            text=f"Local database: {DB_PATH}",
-            wraplength=900,
-        ).pack(anchor="w", padx=8, pady=8)
+        db_lbl = ttk.Label(parent, text=f"Local database: {DB_PATH}")
+        db_lbl.pack(anchor="w", padx=8, pady=8)
+        self._register_wrap_label(db_lbl, fraction=0.85)
 
         self.rvc_root.trace_add("write", lambda *_a: self._on_rvc_root_changed())
 
@@ -1866,26 +1925,24 @@ class App:
     # ---- Tab 1: Audio Scan ----
 
     def _build_tab_audio_scan(self, parent: ttk.Frame) -> None:
-        roots_frame = ttk.LabelFrame(parent, text="Root directories", padding=10)
-        roots_frame.pack(fill="x", padx=4, pady=4)
-        self._configure_cols(roots_frame)
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
 
-        ttk.Label(
-            roots_frame,
-            text="Add folders to scan recursively (e.g. E:\\_haud). Saved in rvc_gui.db.",
-            wraplength=900,
-        ).grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 8))
+        roots_frame = ttk.LabelFrame(parent, text="Root directories", padding=8)
+        roots_frame.grid(row=0, column=0, sticky="ew", padx=4, pady=4)
+        roots_frame.columnconfigure(0, weight=1)
 
         list_wrap = ttk.Frame(roots_frame)
-        list_wrap.grid(row=1, column=0, columnspan=4, sticky="ew", pady=4)
+        list_wrap.grid(row=0, column=0, sticky="ew", pady=2)
         list_wrap.columnconfigure(0, weight=1)
         self.as_roots_list = tk.Listbox(
             list_wrap,
-            height=4,
+            height=3,
             exportselection=False,
             bg=self.colors["field"],
             fg=self.colors["fg"],
-            selectbackground=self.colors.get("select_bg", "#3b8ed0"),
+            selectbackground=self.colors["select"],
+            selectforeground=self.colors.get("select_fg", self.colors["fg"]),
             highlightthickness=0,
         )
         as_roots_sb = ttk.Scrollbar(list_wrap, orient="vertical", command=self.as_roots_list.yview)
@@ -1894,14 +1951,30 @@ class App:
         as_roots_sb.grid(row=0, column=1, sticky="ns")
 
         btns = ttk.Frame(roots_frame)
-        btns.grid(row=1, column=4, sticky="n", padx=(8, 0))
+        btns.grid(row=0, column=1, sticky="n", padx=(8, 0))
         ttk.Button(btns, text="Add folder…", command=self._as_add_root).pack(fill="x", pady=2)
         ttk.Button(btns, text="Remove", command=self._as_remove_root).pack(fill="x", pady=2)
-        self.as_scan_btn = ttk.Button(btns, text="Scan", command=self._as_start_scan)
-        self.as_scan_btn.pack(fill="x", pady=(12, 2))
+        self.as_scan_btn = ttk.Button(
+            btns, text="Scan", command=self._as_start_scan, style=BTN_STYLE_SCAN
+        )
+        self.as_scan_btn.pack(fill="x", pady=(10, 2))
 
-        filt = ttk.Frame(roots_frame)
-        filt.grid(row=2, column=0, columnspan=5, sticky="ew", pady=(8, 0))
+        self.as_status = tk.StringVar(value="No scan yet.")
+        ttk.Label(roots_frame, textvariable=self.as_status).grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=(6, 0)
+        )
+        self.as_progress = ttk.Progressbar(
+            roots_frame, mode="determinate", maximum=100, value=0
+        )
+        self.as_progress.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+
+        table = ttk.LabelFrame(parent, text="Audio files", padding=6)
+        table.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
+        table.rowconfigure(1, weight=1)
+        table.columnconfigure(0, weight=1)
+
+        filt = ttk.Frame(table)
+        filt.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
         filt.columnconfigure(1, weight=1)
         ttk.Label(filt, text="Filter").grid(row=0, column=0, sticky="w", padx=(0, 8))
         filter_entry = ttk.Entry(filt, textvariable=self.as_filter)
@@ -1936,24 +2009,12 @@ class App:
         ttk.Button(filt, text="Apply", command=self._as_apply_filter, width=8).grid(
             row=0, column=7, padx=(12, 0)
         )
-        # Force paint: readonly Combobox can stay blank until first focus on some themes.
         self.as_kind_combo.set(self.as_kind_filter.get() or "all")
         self.as_sort_combo.set(self.as_sort_label.get())
 
-        self.as_status = tk.StringVar(value="No scan yet.")
-        ttk.Label(roots_frame, textvariable=self.as_status).grid(
-            row=3, column=0, columnspan=5, sticky="w", pady=(8, 0)
-        )
-        self.as_progress = ttk.Progressbar(
-            roots_frame, mode="determinate", maximum=100, value=0
-        )
-        self.as_progress.grid(row=4, column=0, columnspan=5, sticky="ew", pady=(4, 0))
-
-        table = ttk.LabelFrame(parent, text="Audio files", padding=6)
-        table.pack(fill="both", expand=True, padx=4, pady=4)
         cols = ("kind", "root", "rel", "name", "size", "duration", "path")
         self.as_tree = ttk.Treeview(
-            table, columns=cols, show="headings", height=18, selectmode="browse"
+            table, columns=cols, show="headings", selectmode="browse"
         )
         headings = {
             "kind": ("Kind", 108),
@@ -1971,25 +2032,9 @@ class App:
         ysb = ttk.Scrollbar(table, orient="vertical", command=self.as_tree.yview)
         xsb = ttk.Scrollbar(table, orient="horizontal", command=self.as_tree.xview)
         self.as_tree.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
-        self.as_tree.grid(row=0, column=0, sticky="nsew")
-        ysb.grid(row=0, column=1, sticky="ns")
-        xsb.grid(row=1, column=0, sticky="ew")
-        table.rowconfigure(0, weight=1)
-        table.columnconfigure(0, weight=1)
-        try:
-            bg = self.colors["field"]
-            fg = self.colors["fg"]
-            self.as_tree.configure(style="Treeview")
-            style = ttk.Style(self.root)
-            style.configure("Treeview", background=bg, foreground=fg, fieldbackground=bg)
-            style.configure(
-                "Treeview.Heading",
-                background=self.colors["button"],
-                foreground=fg,
-            )
-        except tk.TclError:
-            pass
-
+        self.as_tree.grid(row=1, column=0, sticky="nsew")
+        ysb.grid(row=1, column=1, sticky="ns")
+        xsb.grid(row=2, column=0, sticky="ew")
         self.as_tree.bind("<Button-1>", self._as_on_tree_click, add="+")
 
     def _as_kind_column_id(self) -> str:
@@ -2368,22 +2413,22 @@ class App:
     # ---- Tab 2: Source Audio ----
 
     def _build_tab_source_audio(self, parent: ttk.Frame) -> None:
-        ctrl = ttk.LabelFrame(parent, text="Source files from last scan", padding=10)
-        ctrl.pack(fill="x", padx=4, pady=4)
-        self._configure_cols(ctrl)
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
 
-        ttk.Label(
+        ctrl = ttk.LabelFrame(parent, text="Source files from last scan", padding=8)
+        ctrl.grid(row=0, column=0, sticky="ew", padx=4, pady=4)
+        ctrl.columnconfigure(0, weight=1)
+
+        hint = ttk.Label(
             ctrl,
-            text=(
-                "Click Note to edit · click Score stars (1–3) to rate (same star again clears) · "
-                "right-click Auto process = Separate + Convert (current model) · "
-                "double-click other columns to play."
-            ),
-            wraplength=960,
-        ).grid(row=0, column=0, columnspan=6, sticky="w", pady=(0, 8))
+            text="Note/Score click to edit · Cvt opens Convert · green rows = converted · Auto process via right-click",
+        )
+        hint.grid(row=0, column=0, sticky="w", pady=(0, 6))
+        self._register_wrap_label(hint, fraction=0.9)
 
         filt = ttk.Frame(ctrl)
-        filt.grid(row=1, column=0, columnspan=6, sticky="ew")
+        filt.grid(row=1, column=0, sticky="ew")
         filt.columnconfigure(1, weight=1)
         ttk.Label(filt, text="Filter").grid(row=0, column=0, sticky="w", padx=(0, 8))
         ttk.Entry(filt, textvariable=self.src_filter).grid(row=0, column=1, sticky="ew")
@@ -2403,23 +2448,9 @@ class App:
             variable=self.src_sort_desc,
             command=self._on_src_sort_changed,
         ).grid(row=0, column=4, padx=(8, 0), sticky="w")
-        btns = ttk.Frame(filt)
-        btns.grid(row=0, column=5, sticky="e", padx=(12, 0))
-        ttk.Button(btns, text="Apply", command=self._refresh_source_list, width=8).pack(
-            side="left", padx=(0, 4)
-        )
-        ttk.Button(btns, text="Refresh", command=self._src_manual_refresh, width=8).pack(
-            side="left", padx=(0, 4)
-        )
-        ttk.Button(btns, text="Play", command=self._src_play_selected, width=8).pack(
-            side="left", padx=(0, 4)
-        )
-        ttk.Button(
-            btns, text="Process", command=self._src_go_process, style=BTN_STYLE_PROCESS, width=9
-        ).pack(side="left")
 
         score_row = ttk.Frame(ctrl)
-        score_row.grid(row=2, column=0, columnspan=6, sticky="w", pady=(8, 0))
+        score_row.grid(row=2, column=0, sticky="w", pady=(6, 0))
         ttk.Label(score_row, text="Score").grid(row=0, column=0, sticky="w", padx=(0, 8))
         for i, var in enumerate(self.src_score_filters):
             ttk.Checkbutton(
@@ -2429,15 +2460,32 @@ class App:
                 command=self._on_src_score_filter_changed,
             ).grid(row=0, column=i + 1, sticky="w", padx=(0, 10))
 
+        actions = ttk.Frame(ctrl)
+        actions.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(actions, text="Apply", command=self._refresh_source_list, width=8).pack(
+            side="left", padx=(0, 4)
+        )
+        ttk.Button(actions, text="Refresh", command=self._src_manual_refresh, width=8).pack(
+            side="left", padx=(0, 4)
+        )
+        ttk.Button(actions, text="Play", command=self._src_play_selected, width=8).pack(
+            side="left", padx=(0, 4)
+        )
+        ttk.Button(
+            actions, text="Process", command=self._src_go_process, style=BTN_STYLE_PROCESS, width=9
+        ).pack(side="left")
+
         self.src_status = tk.StringVar(value="No source files yet.")
         ttk.Label(ctrl, textvariable=self.src_status).grid(
-            row=3, column=0, columnspan=6, sticky="w", pady=(8, 0)
+            row=4, column=0, sticky="w", pady=(6, 0)
         )
 
         table = ttk.LabelFrame(parent, text="Source audio", padding=6)
-        table.pack(fill="both", expand=True, padx=4, pady=4)
+        table.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
+        table.rowconfigure(0, weight=1)
+        table.columnconfigure(0, weight=1)
         self.src_tree = ttk.Treeview(
-            table, columns=SRC_TREE_COLUMNS, show="headings", height=18, selectmode="browse"
+            table, columns=SRC_TREE_COLUMNS, show="headings", selectmode="browse"
         )
         headings = {
             "name": "File",
@@ -2464,22 +2512,12 @@ class App:
         self.src_tree.grid(row=0, column=0, sticky="nsew")
         ysb.grid(row=0, column=1, sticky="ns")
         xsb.grid(row=1, column=0, sticky="ew")
-        table.rowconfigure(0, weight=1)
-        table.columnconfigure(0, weight=1)
 
-        try:
-            bg = self.colors["field"]
-            fg = self.colors["fg"]
-            self.src_tree.configure(style="Treeview")
-            style = ttk.Style(self.root)
-            style.configure("Treeview", background=bg, foreground=fg, fieldbackground=bg)
-            style.configure(
-                "Treeview.Heading",
-                background=self.colors["button"],
-                foreground=fg,
-            )
-        except tk.TclError:
-            pass
+        self.src_tree.tag_configure(
+            "converted",
+            background=self.colors.get("converted_bg", "#1e3d28"),
+            foreground=self.colors.get("converted_fg", "#b8f0c0"),
+        )
 
         self.src_tree.bind("<Double-1>", self._src_on_tree_double_click)
         self.src_tree.bind("<Button-1>", self._src_on_tree_click, add="+")
@@ -2493,10 +2531,6 @@ class App:
             command=self._src_play_context_item,
         )
         self._src_context_menu.add_command(
-            label="Process",
-            command=self._src_process_context_item,
-        )
-        self._src_context_menu.add_command(
             label="Auto process",
             command=self._src_auto_process_context_item,
         )
@@ -2505,29 +2539,8 @@ class App:
             command=self._src_show_in_audio_scan,
         )
         self._src_context_menu.add_command(
-            label="Show in Convert",
-            command=self._src_show_in_convert,
-        )
-        self._src_context_menu.add_command(
             label="Show in Explorer",
             command=self._src_show_context_path_in_explorer,
-        )
-        self._src_context_menu.add_separator()
-        self._src_context_menu.add_command(
-            label="Score ★☆☆ (1)",
-            command=lambda: self._src_set_context_score(1),
-        )
-        self._src_context_menu.add_command(
-            label="Score ★★☆ (2)",
-            command=lambda: self._src_set_context_score(2),
-        )
-        self._src_context_menu.add_command(
-            label="Score ★★★ (3)",
-            command=lambda: self._src_set_context_score(3),
-        )
-        self._src_context_menu.add_command(
-            label="Clear score",
-            command=lambda: self._src_set_context_score(0),
         )
 
     @staticmethod
@@ -2596,6 +2609,9 @@ class App:
         self._save_settings()
 
     def _on_src_tree_select(self, _event: tk.Event | None = None) -> None:
+        # Don't rewrite Convert paths while a job is using the locked snapshot.
+        if self.running:
+            return
         path = self._src_selected_path()
         if path:
             self._set_convert_context_for_source(path)
@@ -2627,6 +2643,9 @@ class App:
 
     def _src_score_column_id(self) -> str:
         return "#5"
+
+    def _src_converted_column_id(self) -> str:
+        return "#6"
 
     def _src_path_column_id(self) -> str:
         return "#7"
@@ -2903,16 +2922,6 @@ class App:
         else:
             self._refresh_source_list(sort_only=True)
 
-    def _src_set_context_score(self, score: int) -> None:
-        path = self._src_context_reveal_path or self._src_selected_path()
-        if not path:
-            return
-        item = None
-        sel = self.src_tree.selection()
-        if sel:
-            item = sel[0]
-        self._src_set_score(path, score, item=item)
-
     def _src_on_tree_click(self, event: tk.Event) -> None:
         if self.src_tree.identify_region(event.x, event.y) != "cell":
             return
@@ -2935,10 +2944,23 @@ class App:
             cur = get_source_score(path, self._stem_links)
             new_score = 0 if clicked == cur else clicked
             self._src_set_score(path, new_score, item=item)
+            return
+        if col == self._src_converted_column_id():
+            path = self._src_path_from_item(item)
+            if not path:
+                return
+            self.src_tree.selection_set(item)
+            self.src_tree.focus(item)
+            self._src_context_reveal_path = path
+            self.root.after_idle(self._src_show_in_convert)
 
     def _src_on_tree_double_click(self, event: tk.Event) -> None:
         col = self.src_tree.identify_column(event.x)
-        if col in (self._src_note_column_id(), self._src_score_column_id()):
+        if col in (
+            self._src_note_column_id(),
+            self._src_score_column_id(),
+            self._src_converted_column_id(),
+        ):
             return
         self._src_play_selected()
 
@@ -3046,11 +3068,14 @@ class App:
                     str(cvt_n),
                     row.path,
                 ),
+                tags=("converted",) if cvt_n > 0 else (),
             )
         total_bytes = sum(item[0].size_bytes for item in ordered)
         scored = sum(1 for _r, _n, _c, sc in ordered if sc > 0)
+        converted = sum(1 for _r, _n, c, _sc in ordered if c > 0)
         self.src_status.set(
-            f"showing={len(ordered)}  scored={scored}  total={format_size(total_bytes)}"
+            f"showing={len(ordered)}  scored={scored}  converted={converted}  "
+            f"total={format_size(total_bytes)}"
         )
 
     # ---- Tab 3: Process ----
@@ -3071,9 +3096,9 @@ class App:
 
         ttk.Label(info, text="Path").grid(row=1, column=0, sticky="nw", padx=(0, 8), pady=4)
         self.proc_path_var = tk.StringVar(value="")
-        ttk.Label(info, textvariable=self.proc_path_var, wraplength=720).grid(
-            row=1, column=1, columnspan=3, sticky="w", pady=4
-        )
+        proc_path_lbl = ttk.Label(info, textvariable=self.proc_path_var)
+        proc_path_lbl.grid(row=1, column=1, columnspan=3, sticky="w", pady=4)
+        self._register_wrap_label(proc_path_lbl, fraction=0.75)
 
         ttk.Label(info, text="Size").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
         self.proc_size_var = tk.StringVar(value="")
@@ -3089,18 +3114,18 @@ class App:
         self._process_inst_path: str | None = None
 
         ttk.Label(stems, text="Vocals").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Label(stems, textvariable=self.proc_vocals_var).grid(
-            row=0, column=1, sticky="ew", pady=4
-        )
+        vocals_lbl = ttk.Label(stems, textvariable=self.proc_vocals_var)
+        vocals_lbl.grid(row=0, column=1, sticky="ew", pady=4)
+        self._register_wrap_label(vocals_lbl, fraction=0.7)
         self.proc_vocals_play = ttk.Button(
             stems, text="Play", command=self._proc_play_vocals, state="disabled"
         )
         self.proc_vocals_play.grid(row=0, column=2, sticky="e", pady=4)
 
         ttk.Label(stems, text="Instrumental").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Label(stems, textvariable=self.proc_inst_var).grid(
-            row=1, column=1, sticky="ew", pady=4
-        )
+        inst_lbl = ttk.Label(stems, textvariable=self.proc_inst_var)
+        inst_lbl.grid(row=1, column=1, sticky="ew", pady=4)
+        self._register_wrap_label(inst_lbl, fraction=0.7)
         self.proc_inst_play = ttk.Button(
             stems, text="Play", command=self._proc_play_inst, state="disabled"
         )
@@ -3123,14 +3148,12 @@ class App:
         )
         self.proc_convert_btn.pack(side="left")
 
-        ttk.Label(
+        proc_tip = ttk.Label(
             parent,
-            text=(
-                "Open from Source Audio via Process. Separation uses the same MelBand model "
-                "as the Separate tab; outputs are written beside the source file."
-            ),
-            wraplength=900,
-        ).pack(anchor="w", padx=8, pady=6)
+            text="Open from Source Audio → Process. MelBand outputs are written beside the source.",
+        )
+        proc_tip.pack(anchor="w", padx=8, pady=6)
+        self._register_wrap_label(proc_tip, fraction=0.85)
 
     def _proc_play_source(self) -> None:
         if self._process_source_path:
@@ -3291,16 +3314,14 @@ class App:
         self.sep_start_btn = ttk.Button(
             f, text="Start Separate", command=self.run_separate, style=BTN_STYLE_SEPARATE
         )
-        self.sep_start_btn.grid(row=5, column=3, sticky="e", padx=(10, 0), pady=8)
+        self.sep_start_btn.grid(row=5, column=0, columnspan=5, sticky="ew", pady=8)
 
-        ttk.Label(
+        sep_tip = ttk.Label(
             parent,
-            text=(
-                "Exports 2 stems: Vocals + Instrumental. Uses local audio-separator venv "
-                "(see Settings). Global Start is disabled on this tab."
-            ),
-            wraplength=900,
-        ).pack(anchor="w", padx=8, pady=6)
+            text="Exports Vocals + Instrumental via local audio-separator venv (see Settings).",
+        )
+        sep_tip.pack(anchor="w", padx=8, pady=6)
+        self._register_wrap_label(sep_tip, fraction=0.85)
 
     def _browse_sep_input(self) -> None:
         path = filedialog.askopenfilename(
@@ -3477,15 +3498,14 @@ class App:
     # ---- Tab 5: Convert ----
 
     def _build_tab_convert(self, parent: ttk.Frame) -> None:
-        _half_wrap = 360
-
         top_row = ttk.Frame(parent)
-        top_row.pack(fill="x", padx=4, pady=4)
+        top_row.pack(fill="both", expand=True, padx=4, pady=4)
         top_row.columnconfigure(0, weight=1, uniform="convert_top")
         top_row.columnconfigure(1, weight=1, uniform="convert_top")
+        top_row.rowconfigure(0, weight=1)
 
         source_box = ttk.LabelFrame(top_row, text="Converting source audio", padding=10)
-        source_box.grid(row=0, column=0, sticky="new", padx=(0, 4))
+        source_box.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
         self._configure_cols(source_box)
 
         ttk.Label(source_box, text="File").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
@@ -3495,32 +3515,34 @@ class App:
         )
         ttk.Label(source_box, text="Path").grid(row=1, column=0, sticky="nw", padx=(0, 8), pady=4)
         self.conv_source_path_var = tk.StringVar(value="")
-        ttk.Label(source_box, textvariable=self.conv_source_path_var, wraplength=_half_wrap).grid(
-            row=1, column=1, columnspan=3, sticky="w", pady=4
-        )
+        conv_src_lbl = ttk.Label(source_box, textvariable=self.conv_source_path_var)
+        conv_src_lbl.grid(row=1, column=1, columnspan=3, sticky="w", pady=4)
+        self._register_wrap_label(conv_src_lbl, fraction=0.42)
         ttk.Label(source_box, text="Vocals (infer)").grid(
             row=2, column=0, sticky="nw", padx=(0, 8), pady=4
         )
         self.conv_vocals_path_var = tk.StringVar(value="")
-        ttk.Label(source_box, textvariable=self.conv_vocals_path_var, wraplength=_half_wrap).grid(
-            row=2, column=1, columnspan=3, sticky="w", pady=4
-        )
+        conv_voc_lbl = ttk.Label(source_box, textvariable=self.conv_vocals_path_var)
+        conv_voc_lbl.grid(row=2, column=1, columnspan=3, sticky="w", pady=4)
+        self._register_wrap_label(conv_voc_lbl, fraction=0.42)
         ttk.Label(source_box, text="Instrumental (merge)").grid(
             row=3, column=0, sticky="nw", padx=(0, 8), pady=4
         )
         self.conv_bgm_path_var = tk.StringVar(value="")
-        ttk.Label(source_box, textvariable=self.conv_bgm_path_var, wraplength=_half_wrap).grid(
-            row=3, column=1, columnspan=3, sticky="w", pady=4
-        )
-        ttk.Label(
+        conv_bgm_lbl = ttk.Label(source_box, textvariable=self.conv_bgm_path_var)
+        conv_bgm_lbl.grid(row=3, column=1, columnspan=3, sticky="w", pady=4)
+        self._register_wrap_label(conv_bgm_lbl, fraction=0.42)
+        conv_tip = ttk.Label(
             source_box,
-            text="Set from Source Audio → Process → Convert. Infer uses the separated vocals stem.",
-            wraplength=_half_wrap,
-        ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(4, 0))
+            text="Set from Source Audio → Process → Convert. Infer uses separated vocals.",
+        )
+        conv_tip.grid(row=4, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        self._register_wrap_label(conv_tip, fraction=0.42)
 
         results_box = ttk.LabelFrame(top_row, text="Convert results", padding=6)
-        results_box.grid(row=0, column=1, sticky="new", padx=(4, 0))
+        results_box.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
         results_box.columnconfigure(0, weight=1)
+        results_box.rowconfigure(1, weight=1)
 
         result_ctrl = ttk.Frame(results_box)
         result_ctrl.grid(row=0, column=0, sticky="ew", pady=(0, 6))
@@ -3590,9 +3612,6 @@ class App:
         )
         self.fav_model_combo.grid(row=0, column=1, sticky="ew")
         self.fav_model_combo.bind("<<ComboboxSelected>>", self._apply_favorite_model)
-        ttk.Button(fav_row, text="Apply favorite", command=self._apply_favorite_model).grid(
-            row=0, column=2, sticky="e", padx=(8, 0)
-        )
 
         self._row_path(infer, 2, "index (.index)", self.im_index_path, self._browse_im_index)
         self._row_readonly(infer, 3, "model_name", self.im_model_name)
@@ -3662,14 +3681,15 @@ class App:
             row=5, column=1, sticky="w", padx=4
         )
 
-        ttk.Label(
+        conv_params_tip = ttk.Label(
             params,
             text=(
                 "Speech tip: protect≈0.33, breath_mix_rate 0.5–0.85 (0=off; needs patched 0718). "
                 "index_rate 0.5–0.75. UV F0 no-interp is on in 0718 pipeline."
             ),
-            wraplength=_half_wrap,
-        ).grid(row=6, column=0, columnspan=5, sticky="w", pady=(4, 0))
+        )
+        conv_params_tip.grid(row=6, column=0, columnspan=5, sticky="w", pady=(4, 0))
+        self._register_wrap_label(conv_params_tip, fraction=0.42)
 
         actions = ttk.Frame(parent)
         actions.pack(fill="x", padx=4, pady=8)
@@ -3678,11 +3698,12 @@ class App:
         )
         self.im_convert_btn.pack(side="left")
 
-        ttk.Label(
+        conv_foot = ttk.Label(
             parent,
-            text="Convert runs long infer, then merges with BGM on success. Global Start is disabled here.",
-            wraplength=900,
-        ).pack(anchor="w", padx=8, pady=6)
+            text="Convert runs long infer, then merges with BGM on success.",
+        )
+        conv_foot.pack(anchor="w", padx=8, pady=6)
+        self._register_wrap_label(conv_foot, fraction=0.9)
 
         for var in (
             self.im_model_path,
@@ -3960,13 +3981,15 @@ class App:
 
     def _set_running(self, running: bool) -> None:
         self.running = running
-        self.start_btn.config(state="disabled" if running else "normal")
-        self.stop_btn.config(state="normal" if running else "disabled")
+        if hasattr(self, "stop_btn"):
+            self.stop_btn.config(state="normal" if running else "disabled")
         st = "disabled" if running else "normal"
         if hasattr(self, "im_convert_btn"):
             self.im_convert_btn.config(state=st)
         if hasattr(self, "sep_start_btn"):
             self.sep_start_btn.config(state=st)
+        if hasattr(self, "as_scan_btn"):
+            self.as_scan_btn.config(state=st)
         if hasattr(self, "proc_sep_btn"):
             if running:
                 self.proc_sep_btn.config(state="disabled")
@@ -3981,10 +4004,8 @@ class App:
             self._reset_job_progress()
             self.root.title(BASE_TITLE)
             self.status_var.set("Idle")
-            self._update_global_start_state()
 
     def _on_tab_changed(self, _event: tk.Event | None = None) -> None:
-        self._update_global_start_state()
         try:
             if self.notebook.index(self.notebook.select()) == TAB_PROCESS:
                 self._refresh_process_tab()
@@ -3993,25 +4014,6 @@ class App:
         except tk.TclError:
             pass
         self._save_settings()
-
-    def _update_global_start_state(self) -> None:
-        if self.running:
-            return
-        try:
-            idx = self.notebook.index(self.notebook.select())
-        except tk.TclError:
-            return
-        if idx in (
-            TAB_SETTINGS,
-            TAB_AUDIO_SCAN,
-            TAB_SOURCE,
-            TAB_PROCESS,
-            TAB_SEPARATE,
-            TAB_CONVERT,
-        ):
-            self.start_btn.config(state="disabled")
-        else:
-            self.start_btn.config(state="normal")
 
     def _creationflags(self) -> int:
         if sys.platform == "win32":
@@ -4124,30 +4126,6 @@ class App:
     # Job builders
     # ------------------------------------------------------------------
 
-    def start_current_tab(self) -> None:
-        idx = self.notebook.index(self.notebook.select())
-        if idx == TAB_SETTINGS:
-            messagebox.showinfo("Settings", "Configure RVC root here; use other tabs to run jobs.")
-            return
-        if idx == TAB_AUDIO_SCAN:
-            messagebox.showinfo("Audio Scan", "Use Scan on this tab (roots are saved automatically).")
-            return
-        if idx == TAB_SOURCE:
-            messagebox.showinfo("Source Audio", "Browse source files from the last Audio Scan.")
-            return
-        if idx == TAB_PROCESS:
-            messagebox.showinfo(
-                "Process",
-                "Select a source file on Source Audio and press Process, or use Separate here.",
-            )
-            return
-        if idx == TAB_SEPARATE:
-            messagebox.showinfo("Separate", "Use Start Separate on this tab.")
-            return
-        if idx == TAB_CONVERT:
-            messagebox.showinfo("Convert", "Configure model and paths, then press Convert.")
-            return
-
     def _build_infer_cmd(self, root: Path) -> tuple[list[str], str, dict[str, str]] | None:
         self._refresh_im_auto_paths()
         model_path = self.im_model_path.get().strip()
@@ -4214,9 +4192,14 @@ class App:
         env_extra = {"weight_root": str(Path(model_path).parent)}
         return cmd, opt_path, env_extra
 
-    def _build_merge_cmd(self, bgm_path: str) -> tuple[list[str], str, str] | None:
+    def _build_merge_cmd(
+        self,
+        bgm_path: str,
+        *,
+        merge_out: str | None = None,
+    ) -> tuple[list[str], str, str] | None:
         infer_result = (self._convert_infer_temp or "").strip()
-        merge_out = self.im_merge_output_path.get().strip()
+        out_path = (merge_out if merge_out is not None else self.im_merge_output_path.get()).strip()
 
         if not infer_result or not Path(infer_result).is_file():
             messagebox.showerror("Missing result", "Infer output not found for merge.")
@@ -4230,12 +4213,12 @@ class App:
         if not self.im_merge_output_dir.get().strip():
             messagebox.showerror("Missing output", "Select a valid merge_output_dir.")
             return None
-        if not merge_out:
+        if not out_path:
             messagebox.showerror("Missing output", "merge_output_path is empty.")
             return None
 
-        Path(merge_out).parent.mkdir(parents=True, exist_ok=True)
-        ext = Path(merge_out).suffix.lower()
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        ext = Path(out_path).suffix.lower()
         if ext == ".flac":
             codec_args = ["-c:a", "flac", "-compression_level", "8"]
         elif ext == ".wav":
@@ -4259,9 +4242,9 @@ class App:
             "-map",
             "[a]",
             *codec_args,
-            merge_out,
+            out_path,
         ]
-        return cmd, infer_result, merge_out
+        return cmd, infer_result, out_path
 
     def run_convert(self, *, chain: bool = False) -> None:
         root = self._require_rvc_root()
@@ -4291,15 +4274,20 @@ class App:
             messagebox.showerror("Missing output", "Select a valid merge_output_dir.")
             return
         self._refresh_im_merge_output_path()
-        if not self.im_merge_output_path.get().strip():
+        locked_merge_out = self.im_merge_output_path.get().strip()
+        if not locked_merge_out:
             if chain:
                 self._set_running(False)
             messagebox.showerror("Missing output", "merge_output_path is empty.")
             return
 
         def after_infer() -> None:
-            self._refresh_im_merge_output_path()
-            merge_built = self._build_merge_cmd(bgm_path)
+            # Keep the merge path locked at convert-start. Refreshing from UI here
+            # is wrong: selecting another Source Audio row during a long infer
+            # would rewrite merge_output to a different clip (Permission denied /
+            # wrong file).
+            self.im_merge_output_path.set(locked_merge_out)
+            merge_built = self._build_merge_cmd(bgm_path, merge_out=locked_merge_out)
             if merge_built is None:
                 self._set_running(False)
                 messagebox.showerror(

@@ -69,6 +69,37 @@ def test_result_infer_long():
     )
 
 
+def test_merged_convert_output_is_result():
+    """GUI Convert writes ``{model}_{source}_(Merged).ext`` — must not be source."""
+    cases = [
+        "cx_all-cold-noise-badsing__SJ_NTR_SLUT66 女主偷情被抓_GJ_NTR_(Merged).flac",
+        "1_B004 纯享之骚货粗口--小美_(Merged).flac",
+        "model_song_(Merged).flac",
+        "song_(merged).wav",
+        "Song_(MERGED).flac",
+        # Older MelBand-style replace path without model prefix
+        "186 song__(Merged)_vocals_mel_band_roformer.flac",
+    ]
+    for name in cases:
+        assert classify_audio_kind(name, f"_res/{name}") == KIND_RESULT, name
+        assert classify_audio_kind(name, name) == KIND_RESULT, name
+
+
+def test_merged_not_confused_with_plain_source():
+    assert classify_audio_kind("song_merged_take.mp3", "a/song_merged_take.mp3") == KIND_SOURCE
+    assert classify_audio_kind("merge_me.wav", "a/merge_me.wav") == KIND_SOURCE
+
+
+def test_vocals_still_wins_over_unrelated_tokens():
+    assert (
+        classify_audio_kind(
+            "song_(vocals)_vocals_mel_band_roformer.flac",
+            "_res/song_(vocals)_vocals_mel_band_roformer.flac",
+        )
+        == KIND_SEP_VOCALS
+    )
+
+
 def test_normalize_legacy_kinds():
     assert normalize_kind("clone") == KIND_RESULT
     assert normalize_kind("dfn3") == KIND_OTHER
@@ -78,3 +109,15 @@ def test_normalize_legacy_kinds():
 def test_kind_label_roundtrip():
     assert kind_from_label(kind_label(KIND_SOURCE)) == KIND_SOURCE
     assert kind_from_label("instrumental") == KIND_SEP_INST
+
+
+def test_source_filter_excludes_merged():
+    from audio_kind import kind_matches_filter
+
+    kind = classify_audio_kind(
+        "cx_model_clip_(Merged).flac",
+        r"E:\_haud\_res\cx_model_clip_(Merged).flac",
+    )
+    assert kind == KIND_RESULT
+    assert not kind_matches_filter(kind, "source")
+    assert kind_matches_filter(kind, "result")
